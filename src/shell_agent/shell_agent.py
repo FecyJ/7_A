@@ -1,4 +1,4 @@
-"""Shell Agent：负责命令生成、风险审查、确认执行与交互式澄清。"""
+"""Shell Agent，负责命令生成、风险审查、确认执行与交互式澄清。"""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class CommandRiskAssessment:
 SHELL_AGENT_SCHEMA_NAME = "shell_agent_plan"
 SHELL_AGENT_OUTPUT_SCHEMA = {
     "type": "object",
-    "required": ["intent", "reason", "risk_level", "command", "question", "options"],
+    "required": ["intent", "reason", "risk_level", "command", "question", "options", "output_mode"],
     "additionalProperties": False,
     "properties": {
         "intent": {
@@ -105,6 +105,12 @@ SHELL_AGENT_OUTPUT_SCHEMA = {
                 {"type": "null"},
             ]
         },
+        "output_mode": {
+            "anyOf": [
+                {"type": "string", "enum": ["stream", "capture"]},
+                {"type": "null"},
+            ]
+        },
     },
 }
 
@@ -128,6 +134,8 @@ class ShellAgent:
    - 仅当任务足够明确时使用。
    - command 必须是可直接执行的 shell 命令，不要带前导 /。
    - 如果命令具有副作用，也要给出 reason 说明为什么需要这样执行。
+   - output_mode="stream" 表示将原始 stdout/stderr 直接显示给用户，适用于 ping、tail -f、交互式脚本、用户明确要看原始输出的场景。
+   - output_mode="capture" 表示静默执行并捕获输出，不直接把原始输出刷到界面，而是交给后续模块整理为简洁回答；适用于 find/ls/git status 等“采集信息后再汇报”的场景。
 2. intent="ask_clarification"
    - 当目标不明确、路径不明确、或仍需要补充参数时使用。
    - question 要明确告诉用户还缺什么信息。
@@ -141,7 +149,7 @@ class ShellAgent:
 - high: 删除、覆盖、格式化、提权、关机重启、危险 SQL 等高风险操作。
 
 输出格式要求：
-- run_command: question=null, options=null
+- run_command: question=null, options=null, output_mode 必须为 "stream" 或 "capture"
 - ask_clarification: command=null
 - refuse: command=null, question=null, options=null
 
@@ -204,6 +212,42 @@ class ShellAgent:
     @staticmethod
     def _risk_rank(level: RiskLevel) -> int:
         return {"low": 0, "medium": 1, "high": 2}[level]
+
+    @staticmethod
+    def _looks_like_summary_request(*texts: str) -> bool:
+        combined = "\n".join(text for text in texts if text).lower()
+        if not combined:
+            return False
+        markers = [
+            "总结",
+            "概括",
+            "分析",
+            "解释",
+            "说明",
+            "简要",
+            "提炼",
+            "归纳",
+            "summarize",
+            "summary",
+            "analyze",
+            "explain",
+        ]
+        return any(marker in combined for marker in markers)
+
+    @staticmethod
+    def _is_stream_only_command(command: str) -> bool:
+        lowered = command.lower()
+        markers = [
+            "ping ",
+            "tail -f",
+            "top",
+            "htop",
+            "watch ",
+            "less ",
+            "more ",
+            "read -p",
+        ]
+        return any(marker in lowered for marker in markers)
 
     @classmethod
     def _max_risk(cls, *levels: RiskLevel) -> RiskLevel:
@@ -285,11 +329,13 @@ class ShellAgent:
                 plan.setdefault("risk_level", "low")
                 plan.setdefault("question", None)
                 plan.setdefault("options", None)
+                plan.setdefault("output_mode", "stream")
             elif isinstance(plan.get("question"), str) and plan["question"].strip():
                 plan["intent"] = "ask_clarification"
                 plan.setdefault("reason", "模型给出了追问内容，自动补全 intent。")
                 plan.setdefault("risk_level", "low")
                 plan.setdefault("command", None)
+                plan.setdefault("output_mode", None)
             else:
                 plan["intent"] = "refuse"
                 plan.setdefault("reason", "模型未返回可执行命令，自动降级为 refuse。")
@@ -297,6 +343,7 @@ class ShellAgent:
                 plan.setdefault("command", None)
                 plan.setdefault("question", None)
                 plan.setdefault("options", None)
+                plan.setdefault("output_mode", None)
 
         return plan
 
@@ -308,6 +355,8 @@ class ShellAgent:
             if intent == "run_command":
                 if not isinstance(plan.get("command"), str) or not plan["command"].strip():
                     return False, "run_command 必须提供非空 command"
+                if plan.get("output_mode") not in {"stream", "capture"}:
+                    return False, "run_command 的 output_mode 必须为 stream 或 capture"
             elif intent == "ask_clarification":
                 if not isinstance(plan.get("question"), str) or not plan["question"].strip():
                     return False, "ask_clarification 必须提供非空 question"
@@ -325,6 +374,7 @@ class ShellAgent:
             "command": None,
             "question": f"我理解你是想执行 shell 操作：{user_input}\n\n但我还不能安全地确定具体命令，请补充更明确的目标、路径或参数。",
             "options": None,
+            "output_mode": None,
         }
 
     def plan_command(self, user_input: str, routed_task: ShellPlan) -> ShellPlan:
@@ -356,6 +406,7 @@ class ShellAgent:
                 "command": None,
                 "question": None,
                 "options": None,
+                "output_mode": None,
             }
 
         parsed = self._normalize_plan(self._parse_json(raw_text))
@@ -502,6 +553,129 @@ class ShellAgent:
         enriched["context_passed"] = context_passed
         return enriched
 
+    @staticmethod
+    def _attach_process_to_ui(ui: "OrchestratorOutput", process: asyncio.subprocess.Process) -> None:
+        if hasattr(ui, "current_process"):
+            ui.current_process = process
+        if hasattr(ui, "current_process_group_id"):
+            ui.current_process_group_id = process.pid if os.name != "nt" else None
+        if hasattr(ui, "current_process_input_fd"):
+            ui.current_process_input_fd = None
+        if hasattr(ui, "current_process_terminated_by_user"):
+            ui.current_process_terminated_by_user = False
+
+    @staticmethod
+    def _detach_process_from_ui(ui: "OrchestratorOutput") -> None:
+        if hasattr(ui, "current_process"):
+            ui.current_process = None
+        if hasattr(ui, "current_process_group_id"):
+            ui.current_process_group_id = None
+        if hasattr(ui, "current_process_input_fd"):
+            ui.current_process_input_fd = None
+        if hasattr(ui, "current_process_terminated_by_user"):
+            ui.current_process_terminated_by_user = False
+
+    async def _execute_command_capture(
+        self,
+        command: str,
+        ui: "OrchestratorOutput",
+    ) -> dict[str, Any]:
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name != "nt"),
+        )
+        self._attach_process_to_ui(ui, process)
+        try:
+            stdout_data, stderr_data = await process.communicate()
+            terminated = bool(getattr(ui, "current_process_terminated_by_user", False))
+            return {
+                "stdout": stdout_data.decode("utf-8", errors="replace"),
+                "stderr": stderr_data.decode("utf-8", errors="replace"),
+                "returncode": process.returncode,
+                "terminated_by_user": terminated,
+            }
+        finally:
+            self._detach_process_from_ui(ui)
+
+    def _resolve_output_mode(
+        self,
+        plan: ShellPlan,
+        *,
+        user_input: str,
+        task_description: str,
+        command: str,
+    ) -> str:
+        if self._is_stream_only_command(command):
+            return "stream"
+
+        requested_mode = str(plan.get("output_mode") or "stream").strip().lower()
+        if requested_mode == "capture":
+            return "capture"
+
+        if self._looks_like_summary_request(user_input, task_description, plan.get("reason", "")):
+            return "capture"
+
+        return "stream"
+
+    def _summarize_captured_output(
+        self,
+        *,
+        user_input: str,
+        command: str,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> str:
+        stdout = stdout.strip()
+        stderr = stderr.strip()
+        combined = stdout
+        if stderr:
+            combined = combined + ("\n\n[stderr]\n" if combined else "[stderr]\n") + stderr
+        if not combined:
+            combined = "（命令无输出）"
+
+        truncated = False
+        if len(combined) > 12000:
+            combined = combined[:12000].rstrip() + "\n\n[输出已截断]"
+            truncated = True
+
+        prompt = (
+            "你是命令结果整理助手。请根据用户原始请求和命令输出，"
+            "用简洁、直接、可靠的中文给出最终回答。"
+            "不要复述整个原始输出，不要臆造未出现的信息。"
+            "如果命令失败，请明确说明失败原因。"
+        )
+        truncation_notice = "说明：以下输出已截断。\n" if truncated else ""
+        user_prompt = (
+            f"用户请求：{user_input}\n"
+            f"执行命令：{command}\n"
+            f"退出码：{returncode}\n"
+            f"{truncation_notice}"
+            f"命令输出：\n{combined}"
+        )
+
+        try:
+            return generate_text_response(
+                prompt,
+                user_prompt,
+                llm_client=self.llm_client,
+                model=self.model,
+                temperature=0.2,
+            )
+        except Exception:
+            if returncode != 0:
+                snippet = stderr or stdout or "无更多输出"
+                snippet = self._shorten_command(snippet, max_length=160)
+                return f"命令执行失败（退出码 {returncode}）：{snippet}"
+            if stdout:
+                snippet = stdout.strip()
+                if len(snippet) > 400:
+                    snippet = snippet[:400].rstrip() + "..."
+                return snippet
+            return "命令已执行完成。"
+
     async def _prompt_for_clarification(
         self,
         user_input: str,
@@ -538,6 +712,9 @@ class ShellAgent:
         llm_risk_level: RiskLevel,
         orchestrator_risk_level: RiskLevel,
         reason: str,
+        output_mode: str,
+        user_input: str,
+        task_description: str,
     ) -> ShellPlan:
         self._emit_workflow(ui, "正在进行风险审查...", state="running")
         assessment = self.assess_command_risk(command, llm_risk_level, orchestrator_risk_level)
@@ -548,6 +725,7 @@ class ShellAgent:
             "risk_level": assessment.final_risk,
             "question": None,
             "options": None,
+            "output_mode": output_mode,
             "risk_assessment": {
                 "final_risk": assessment.final_risk,
                 "llm_risk": assessment.llm_risk,
@@ -580,6 +758,36 @@ class ShellAgent:
                 result["status"] = "cancelled_by_user"
                 return result
             self._emit_workflow(ui, "已收到确认，准备执行命令", state="done")
+
+        if output_mode == "capture":
+            self._emit_workflow(
+                ui,
+                f"正在静默执行命令：{self._shorten_command(command)}",
+                state="running",
+            )
+            captured = await self._execute_command_capture(command, ui)
+            result["captured_stdout"] = captured["stdout"]
+            result["captured_stderr"] = captured["stderr"]
+            result["returncode"] = captured["returncode"]
+            if captured["terminated_by_user"]:
+                self._emit_workflow(ui, "用户已终止当前命令", state="warn")
+                result["status"] = "cancelled_by_user"
+                return result
+
+            self._emit_workflow(ui, "已捕获命令输出，正在整理结果...", state="running")
+            summary = await asyncio.to_thread(
+                self._summarize_captured_output,
+                user_input=user_input,
+                command=command,
+                stdout=captured["stdout"],
+                stderr=captured["stderr"],
+                returncode=captured["returncode"] or 0,
+            )
+            await ui.stream_llm(summary)
+            self._emit_workflow(ui, "命令执行流程结束", state="done")
+            result["summary"] = summary
+            result["status"] = "executed_captured"
+            return result
 
         if shell_executor is None:
             self._emit_workflow(
@@ -615,6 +823,9 @@ class ShellAgent:
             llm_risk_level="low",
             orchestrator_risk_level="low",
             reason="这是用户直接输入的命令，未经过 LLM 规划；已按本地规则引擎进行风险审查。",
+            output_mode="stream",
+            user_input=command,
+            task_description=command,
         )
 
     async def run(
@@ -663,6 +874,14 @@ class ShellAgent:
                 f"已生成命令：{self._shorten_command(command)}",
                 state="done",
             )
+            output_mode = self._resolve_output_mode(
+                plan,
+                user_input=working_input,
+                task_description=str(working_task.get("task_description", working_input)),
+                command=command,
+            )
+            if output_mode == "capture":
+                self._emit_workflow(ui, "该命令将以静默模式执行，原始输出不会直接展示", state="info")
             reviewed = await self._review_and_execute_command(
                 command,
                 ui,
@@ -670,6 +889,9 @@ class ShellAgent:
                 llm_risk_level=plan.get("risk_level", "low"),
                 orchestrator_risk_level=working_task.get("risk_level", "low"),
                 reason=plan.get("reason", ""),
+                output_mode=output_mode,
+                user_input=working_input,
+                task_description=str(working_task.get("task_description", working_input)),
             )
             reviewed.update(
                 {
@@ -688,6 +910,7 @@ class ShellAgent:
             "command": None,
             "question": "我仍无法安全确定要执行的命令，请提供更明确的文件名、路径或参数。",
             "options": ["手动输入更具体信息", "改用 /命令 直接执行"],
+            "output_mode": None,
             "status": "clarification_limit_reached",
         }
 

@@ -149,8 +149,11 @@ def get_system_prompt(context: dict[str, str]) -> str:
 2. "tool_agent": 需要认知能力、语义分析或调用外部资源的复杂任务。
    - 边界：涉及对文件内容的阅读理解、代码审查、翻译，或需要调用第三方 API。
    - 示例："读取 config.json 并总结里面的数据库配置"、"分析这段代码的复杂度"。
+   - 强规则：凡是“先读取文件/代码/文档内容，再总结、分析、解释、翻译”的任务，一律优先判为 "tool_agent"。
+   - 强规则：凡是“当前时间/日期/星期、天气、新闻、汇率、最新/实时数据”等依赖实时信息的问题，不允许判为 "direct_answer"，应交给可获取实时信息的 Agent。
 3. "direct_answer": 纯知识问答或闲聊，无需系统执行任何操作。
    - 示例："什么是 Python 的 GIL？"、"多 Agent 系统怎么设计？"
+   - 禁止场景：不要把“现在几点了”“今天天气”“最新新闻”“美元兑人民币汇率”等时效性问题判为 direct_answer。
 4. "clarification": (最高优先级) 指令模糊或存在安全隐患，必须追问。
    - 边界：存在你认为无从确定的模糊指代；或者用户要求操作的实体在【当前环境上下文】中不存在并且你无法推断其含义；或者操作极度危险但意图不明。
 
@@ -353,6 +356,149 @@ def _looks_like_shell_request(user_input: str) -> bool:
     return any(marker in lowered for marker in shell_markers)
 
 
+def _looks_like_semantic_file_task(*texts: str) -> bool:
+    """判断是否属于“读取文件内容后再做语义理解”的任务，应优先交给 tool_agent。"""
+    combined = "\n".join(text for text in texts if text).lower()
+    if not combined:
+        return False
+
+    file_markers = [
+        "读取",
+        "读一下",
+        "读出",
+        "read",
+        "open",
+        "查看文件",
+        "文件内容",
+        "readme",
+        "config",
+        "json",
+        "yaml",
+        "toml",
+        "md",
+        "代码",
+        "文档",
+        "日志",
+        ".py",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".txt",
+        ".log",
+    ]
+    semantic_markers = [
+        "总结",
+        "概括",
+        "分析",
+        "解释",
+        "翻译",
+        "review",
+        "summarize",
+        "summary",
+        "analyze",
+        "explain",
+        "理解",
+        "提炼",
+        "归纳",
+        "复杂度",
+        "审查",
+    ]
+    return any(marker in combined for marker in file_markers) and any(
+        marker in combined for marker in semantic_markers
+    )
+
+
+def _detect_temporal_query(*texts: str) -> dict[str, str] | None:
+    """识别天气 / 新闻 / 汇率 / 时间等强时效性问题。"""
+    combined = "\n".join(text for text in texts if text).lower()
+    if not combined:
+        return None
+
+    if any(
+        re.search(pattern, combined)
+        for pattern in [
+            r"现在几点",
+            r"当前几点",
+            r"现在时间",
+            r"当前时间",
+            r"几点了",
+            r"今天几号",
+            r"今天星期几",
+            r"当前日期",
+            r"现在日期",
+            r"今天日期",
+            r"\bcurrent time\b",
+            r"\btime now\b",
+            r"\bcurrent date\b",
+            r"\btoday('?s)? date\b",
+            r"\bwhat time is it\b",
+        ]
+    ):
+        return {"category": "time", "label": "时间/日期"}
+
+    if any(marker in combined for marker in ["天气", "气温", "温度", "weather", "forecast"]):
+        return {"category": "weather", "label": "天气"}
+
+    if any(marker in combined for marker in ["新闻", "头条", "news", "headline"]):
+        return {"category": "news", "label": "新闻"}
+
+    if any(marker in combined for marker in ["汇率", "币价", "exchange rate", "fx rate", "forex"]):
+        return {"category": "exchange_rate", "label": "汇率"}
+    if any(marker in combined for marker in ["美元", "人民币", "欧元", "日元", "英镑", "usd", "cny", "eur", "jpy", "gbp"]) and any(
+        marker in combined for marker in ["汇率", "兑换", "兑", "对", "exchange", "rate", "convert"]
+    ):
+        return {"category": "exchange_rate", "label": "汇率"}
+
+    return None
+
+
+def _looks_like_realtime_time_query(*texts: str) -> bool:
+    """判断是否是依赖当前时间/日期的实时查询。"""
+    info = _detect_temporal_query(*texts)
+    return bool(info and info.get("category") == "time")
+
+
+def _wants_online_lookup(*texts: str) -> bool:
+    combined = "\n".join(text for text in texts if text).lower()
+    if not combined:
+        return False
+    markers = [
+        "联网",
+        "网络",
+        "在线",
+        "上网",
+        "web",
+        "internet",
+        "online",
+        "api",
+    ]
+    return any(marker in combined for marker in markers)
+
+
+def _build_temporal_tool_task(user_input: str, task_description: str = "") -> str:
+    info = _detect_temporal_query(user_input, task_description)
+    category = info.get("category") if info else "temporal_live_data"
+    online_hint = (
+        "用户明确要求联网，优先使用 REST API 获取可验证的实时数据；"
+        if _wants_online_lookup(user_input, task_description)
+        else "优先使用 REST API 或其他确定性实时数据源；"
+    )
+    category_instruction = {
+        "time": "获取当前时间/日期/星期，不要基于模型记忆直接回答。",
+        "weather": "获取目标地点的最新天气信息，不要猜测天气。",
+        "news": "获取最新新闻/头条，不要凭记忆编造“最新消息”。",
+        "exchange_rate": "获取最新汇率，不要凭记忆输出币价。",
+        "temporal_live_data": "获取最新的时效性数据，不要使用过期知识回答。",
+    }.get(category, "获取最新的时效性数据，不要使用过期知识回答。")
+    return (
+        f"{category_instruction}"
+        f"{online_hint}"
+        "若参数不足则先澄清；若获取失败，要明确说明失败原因，不要虚构结果。"
+    )
+
+
 def _looks_like_human_answer(text: str) -> bool:
     """判断文本更像自然语言回答，而不是命令/错误/机器结果。"""
     stripped = text.strip()
@@ -399,6 +545,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
 
     lowered_input = user_input.lower()
     looks_like_shell_request = _looks_like_shell_request(user_input)
+    temporal_query_info = _detect_temporal_query(user_input)
     clarification_markers = [
         "请问",
         "能否",
@@ -491,7 +638,24 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
             )
         )
         and not looks_like_shell_request
+        and temporal_query_info is None
     )
+
+    if temporal_query_info is not None:
+        return {
+            "intent": "tool_agent",
+            "reasoning": (
+                f"结构化解析失败，但检测到这是“{temporal_query_info['label']}”类时效性问题，"
+                "保守降级为 tool_agent 处理。"
+            ),
+            "confidence": 0.55,
+            "risk_level": "low",
+            "reply": None,
+            "task_description": _build_temporal_tool_task(user_input),
+            "context_passed": [user_input],
+            "question": None,
+            "options": None,
+        }
 
     if looks_like_direct_answer and not looks_like_clarification:
         return {
@@ -538,6 +702,44 @@ def apply_confidence_policy(result: IntentResult) -> IntentResult:
         result.setdefault("question", "你的指令不太明确，能否提供更多细节？")
         if not isinstance(result.get("options"), list):
             result["options"] = []
+
+    return result
+
+
+def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResult:
+    """基于确定性本地规则，对明显误路由结果做轻量纠偏。"""
+    result = dict(result)
+    intent = result.get("intent")
+    task_description = str(result.get("task_description") or "")
+    temporal_query_info = _detect_temporal_query(user_input, task_description)
+
+    if temporal_query_info is not None:
+        reasoning = str(result.get("reasoning") or "").strip()
+        result["intent"] = "tool_agent"
+        result["risk_level"] = "low"
+        result["task_description"] = _build_temporal_tool_task(user_input, task_description)
+        result["context_passed"] = [user_input]
+        result["reply"] = None
+        result["question"] = None
+        result["options"] = None
+        if reasoning:
+            reasoning += (
+                f"；检测到这是“{temporal_query_info['label']}”类时效性问题，"
+                "禁止 direct_answer，改路由为 tool_agent。"
+            )
+        else:
+            reasoning = f"检测到这是“{temporal_query_info['label']}”类时效性问题，禁止 direct_answer，改路由为 tool_agent。"
+        result["reasoning"] = reasoning
+        return result
+
+    if intent == "shell_agent" and _looks_like_semantic_file_task(user_input, task_description):
+        reasoning = str(result.get("reasoning") or "").strip()
+        result["intent"] = "tool_agent"
+        if reasoning:
+            reasoning += "；检测到这是“读取文件后做语义理解/总结”的任务，按规则改路由为 tool_agent。"
+        else:
+            reasoning = "检测到这是“读取文件后做语义理解/总结”的任务，按规则路由为 tool_agent。"
+        result["reasoning"] = reasoning
 
     return result
 
@@ -616,6 +818,7 @@ def handle_intent(
         max_retries=max_retries,
         verbose=verbose,
     )
+    result = apply_intent_overrides(user_input, result)
     return apply_confidence_policy(result)
 
 

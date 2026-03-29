@@ -1,6 +1,7 @@
 """
 Task 2.3 - 总控 Agent（Orchestrator）
-功能：对接前端输入，完成命令直通 / 意图分类 / 结果输出与路由。
+功能：对接前端输入，完成命令直通 / 意图分类 / 结果输出与路由，
+并正式接入本地 NLP Fast-Path + 云端兜底双引擎流程。
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ try:
     )
     from .llm_client import generate_text_response, get_api_mode, get_llm_client
     from ..shell_agent import ShellAgent
+    from ..tool_agent import ToolAgent
+    from Bonus.local_nlp import DualEngineRouter
 except ImportError:
     from intent_classifier import (  # type: ignore
         DEFAULT_MODEL,
@@ -40,6 +43,14 @@ except ImportError:
         from src.shell_agent import ShellAgent  # type: ignore
     except ImportError:
         from shell_agent import ShellAgent  # type: ignore
+    try:
+        from src.tool_agent import ToolAgent  # type: ignore
+    except ImportError:
+        from tool_agent import ToolAgent  # type: ignore
+    try:
+        from Bonus.local_nlp import DualEngineRouter  # type: ignore
+    except ImportError:
+        DualEngineRouter = None  # type: ignore
 
 
 class OrchestratorOutput(Protocol):
@@ -227,7 +238,7 @@ async def execute_command_async(command: str, ui: OrchestratorOutput | None = No
 
 
 class OrchestratorAgent:
-    """可直接对接前端的后端总控 Agent。"""
+    """可直接对接前端的后端总控 Agent(核心逻辑)。"""
 
     def __init__(
         self,
@@ -241,7 +252,22 @@ class OrchestratorAgent:
         self.llm_client = llm_client or client
         self.model = model or DEFAULT_MODEL
         self.verbose = verbose
+
+        # shell_agent 初始化
         self.shell_agent = ShellAgent(llm_client=self.llm_client, model=self.model)
+        # tool_agent 初始化
+        self.tool_agent = ToolAgent(llm_client=self.llm_client, model=self.model)
+        # 双引擎路由器初始化(如果可用)
+        self.dual_engine_router = (
+            DualEngineRouter(
+                cloud_llm_client=self.llm_client,
+                cloud_model=self.model,
+                max_retries=1,
+                verbose=verbose,
+            )
+            if DualEngineRouter is not None
+            else None
+        )
 
     @staticmethod
     def _risk_label(risk_level: str) -> str:
@@ -262,6 +288,52 @@ class OrchestratorAgent:
         if not content:
             return
         await ui.stream_llm(content, markdown=markdown, language=language)
+
+    @staticmethod
+    async def _local_status_callback(ui: OrchestratorOutput, message: str) -> None:
+        """本地节点不可用时的静默降级提示。"""
+        ui.output_system(message, style="dim")
+
+    def _emit_dual_engine_status(self, ui: OrchestratorOutput, result: OrchestratorResult) -> None:
+        """输出双引擎路由的简洁状态提示。"""
+        meta = result.get("_dual_engine")
+        if not isinstance(meta, dict):
+            return
+
+        engine = meta.get("engine")
+        reason = meta.get("fallback_reason")
+
+        if engine == "local_fastpath":
+            ui.output_system("已命中本地 Fast-Path", style="dim")
+            return
+
+        if engine == "cloud" and reason == "low_confidence":
+            ui.output_system("本地置信度不足，已切换云端", style="dim")
+
+    def _emit_dual_engine_metrics(self, ui: OrchestratorOutput, result: OrchestratorResult) -> None:
+        """在 verbose 模式下输出双引擎路由耗时。"""
+        if not self.verbose:
+            return
+        meta = result.get("_dual_engine")
+        if not isinstance(meta, dict):
+            return
+
+        engine = meta.get("engine", "unknown")
+        local_ms = meta.get("local_latency_ms")
+        cloud_ms = meta.get("cloud_latency_ms")
+        total_ms = meta.get("total_latency_ms")
+        reason = meta.get("fallback_reason")
+
+        parts = [f"route={engine}"]
+        if local_ms is not None:
+            parts.append(f"local={local_ms}ms")
+        if cloud_ms is not None:
+            parts.append(f"cloud={cloud_ms}ms")
+        if total_ms is not None:
+            parts.append(f"total={total_ms}ms")
+        if reason:
+            parts.append(f"fallback={reason}")
+        ui.output_system("[dual-engine] " + " | ".join(parts), style="dim")
 
     @staticmethod
     def _build_clarification_markdown(result: OrchestratorResult) -> str:
@@ -296,6 +368,28 @@ class OrchestratorAgent:
             "status": shell_result.get("status", "handled"),
         }
 
+    async def _handle_tool_agent(
+        self,
+        user_input: str,
+        routed_task: OrchestratorResult,
+        ui: OrchestratorOutput,
+    ) -> OrchestratorResult:
+        """将 tool_agent 路由结果交给真正的 ToolAgent。"""
+        ui.output_workflow("已将任务交给 Tool Agent", state="done")
+        task_description = routed_task.get("task_description")
+        if task_description:
+            ui.output_workflow(f"任务说明：{task_description}", state="info")
+        tool_result = await self.tool_agent.run(
+            routed_task,
+            ui,
+            user_input=user_input,
+        )
+        return {
+            **routed_task,
+            "tool_agent_result": tool_result,
+            "status": tool_result.get("status", "handled"),
+        }
+
     async def handle_input(self, user_input: str, ui: OrchestratorOutput) -> OrchestratorResult:
         """后端统一输入入口：接收用户输入并回写前端。"""
         user_input = user_input.strip()
@@ -322,14 +416,22 @@ class OrchestratorAgent:
             }
 
         ui.output_workflow("正在分析用户意图...", state="running")
-        result = await asyncio.to_thread(
-            handle_intent,
-            user_input,
-            self.llm_client,
-            self.model,
-            1,
-            self.verbose,
-        )
+        if self.dual_engine_router is not None:
+            result = await self.dual_engine_router.route(
+                user_input,
+                status_callback=lambda message: self._local_status_callback(ui, message),
+            )
+        else:
+            result = await asyncio.to_thread(
+                handle_intent,
+                user_input,
+                self.llm_client,
+                self.model,
+                1,
+                self.verbose,
+            )
+        self._emit_dual_engine_status(ui, result)
+        self._emit_dual_engine_metrics(ui, result)
 
         intent = result.get("intent")
         risk_level = result.get("risk_level", "low")
@@ -370,10 +472,7 @@ class OrchestratorAgent:
                 f"已识别为 Tool Agent 任务（{self._risk_label(risk_level)}）",
                 state="done",
             )
-            ui.output_workflow("Tool Agent 尚未接入，当前仅返回路由结果", state="warn")
-            task_description = result.get("task_description")
-            if task_description:
-                ui.output_workflow(f"任务说明：{task_description}", state="info")
+            return await self._handle_tool_agent(user_input, result, ui)
 
         return result
 

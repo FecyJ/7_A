@@ -119,6 +119,24 @@ class AgentCLI(App):
             exclusive=True,
         )
 
+    async def action_quit(self) -> None:
+        """Ctrl + C 优雅退出：先结束当前子进程，再关闭 TUI。"""
+        process = self.current_process
+        if process is not None and process.returncode is None:
+            self.current_process_terminated_by_user = True
+            process_group_id = self.current_process_group_id
+            try:
+                if os.name != "nt" and process_group_id is not None:
+                    os.killpg(process_group_id, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+            else:
+                await self._force_stop_current_process(process, process_group_id)
+
+        self.exit()
+
     def output_user(self, text: str) -> None:
         """输出用户输入"""
         self.query_one("#log_area", AgentRichLog).write_user_message(text)

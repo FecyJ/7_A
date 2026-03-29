@@ -225,7 +225,6 @@ def get_local_system_prompt(context: dict[str, str], extra_context: dict[str, st
 - tool_agent 只在你明确觉得 4B 本地模型不该继续判断时使用。
 - 如果是“记住 / 你还记得 / 列出记忆 / 忘掉”这类显式记忆请求，判为 memory_agent。
 - 如果请求中同时包含“执行任务 + 记住结果”等两个动作，判为 multi_agent（即使你不给 subtasks，也不要判 direct_answer）。
-- 如果请求属于“实现代码 / 写文件 / 生成网页 / 补 README / 在某目录下完成一个 demo 或小游戏”这类落地开发任务，优先判为 multi_agent，不要判为 shell_agent。
 - 如果判为 multi_agent，subtasks 至少要有 2 项；只有 1 项时应改回对应单一 intent。
 - 如果任务是“读取文件/代码/文档后再总结、分析、解释、翻译”，必须判为 tool_agent。
 - 如果任务依赖“当前时间/日期/星期、天气、新闻、汇率、最新/实时数据”等时效性信息，不能判为 direct_answer，必须交给 tool_agent。

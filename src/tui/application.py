@@ -9,8 +9,9 @@ from typing import Any, Awaitable, Callable
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.events import Resize
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Header, Input, ListView, Static
+from textual.widgets import Header, ListView, Static
 
 from Bonus.memory_conv import SessionManager
 
@@ -26,6 +27,11 @@ class AgentCLI(App):
 
     CSS = """
     Screen { layout: vertical; }
+
+    HeaderTitle {
+        content-align: left middle;
+        padding-left: 1;
+    }
 
     #main_body {
         height: 1fr;
@@ -69,13 +75,13 @@ class AgentCLI(App):
 
     #log_area { height: 1fr; border: solid green; }
     #interaction_panel { height: auto; }
-    #command_input { height: 3; }
+    #command_input { height: 5; }
     """
 
     BINDINGS = [
-        Binding("ctrl+n", "new_session", "New", show=True, priority=True),
-        Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True, priority=True),
-        Binding("ctrl+j", "focus_sidebar", "Sessions", show=True, priority=True),
+        Binding("ctrl+n", "new_session", "New Chat", show=True, priority=True),
+        Binding("ctrl+b", "toggle_sidebar", "Toggle Sidebar", show=True, priority=True),
+        Binding("f6", "focus_sidebar", "Focus Sidebar", show=False, priority=True),
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
         Binding("ctrl+d", "kill_process", "Kill", show=True, priority=True),
     ]
@@ -87,6 +93,8 @@ class AgentCLI(App):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.title = os.path.abspath(os.getcwd())
+        self.sub_title = ""
         self.input_handler = input_handler
         self.orchestrator_agent = getattr(input_handler, "agent", None)
         self.session_manager = SessionManager()
@@ -108,7 +116,6 @@ class AgentCLI(App):
         with Horizontal(id="main_body"):
             with Vertical(id="sidebar_panel"):
                 yield Static("会话历史", id="sidebar_header")
-                yield Static("Ctrl+N 新建 · Ctrl+B 折叠 · Ctrl+J 聚焦", id="sidebar_tip")
                 yield SessionSidebar(id="sidebar")
             with Vertical(id="conversation_panel"):
                 yield AgentRichLog(id="log_area")
@@ -127,6 +134,18 @@ class AgentCLI(App):
             exclusive=True,
         )
 
+    def on_resize(self, event: Resize) -> None:
+        """窗口尺寸变化后重排日志，使换行与当前宽度同步。"""
+        del event
+        if not self._session_messages:
+            return
+        self.run_worker(
+            self._rerender_log_after_resize(),
+            name="rerender-log-after-resize",
+            group="log-resize",
+            exclusive=True,
+        )
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """选择文本时，让 Ctrl+C 优先执行复制而不是退出。"""
         del parameters
@@ -136,7 +155,7 @@ class AgentCLI(App):
                 return False
 
             focused = self.focused
-            if isinstance(focused, Input) and not focused.selection.is_empty:
+            if focused is not None and bool(getattr(focused, "selected_text", "")):
                 return False
 
         return True
@@ -192,7 +211,12 @@ class AgentCLI(App):
             active_session_id=self.current_session_id,
         )
 
-    async def _render_session_messages(self, messages: list[dict[str, Any]]) -> None:
+    async def _render_session_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preserve_live_state: bool = False,
+    ) -> None:
         log = self._query_log()
         self._suspend_session_capture = True
         try:
@@ -207,10 +231,11 @@ class AgentCLI(App):
                 elif kind == "system":
                     log.write_system_message(content, style=str(entry.get("style") or ""))
                 elif kind == "workflow":
+                    state = str(entry.get("state") or "info")
                     log.write_workflow_message(
                         content,
-                        state=str(entry.get("state") or "info"),
-                        animate=False,
+                        state=state,
+                        animate=preserve_live_state and state == "running",
                     )
                 elif kind == "llm":
                     log.write_llm_message(
@@ -301,6 +326,23 @@ class AgentCLI(App):
         if target is None:
             target = sessions[0]
         await self._activate_session(str(target.get("id") or ""))
+
+    async def _rerender_log_after_resize(self) -> None:
+        """在窗口拉伸/缩放后按新宽度重绘日志。"""
+        await asyncio.sleep(0)
+        if not self.is_mounted or not self._session_messages:
+            return
+
+        focused = self.focused
+        focus_id = getattr(focused, "id", None)
+        await self._render_session_messages(self._session_messages, preserve_live_state=True)
+
+        if focus_id == "command_input":
+            self._focus_input()
+        elif focus_id == "sidebar":
+            self._query_sidebar().focus()
+        elif focus_id == "log_area":
+            self._query_log().focus()
 
     async def _create_new_session(self) -> None:
         created = self.session_manager.create_session()
@@ -506,14 +548,15 @@ class AgentCLI(App):
             self._schedule_title_generation_if_needed()
             await self._refresh_sidebar()
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_command_input_submitted(self, event: CommandInput.Submitted) -> None:
         """接收输入框提交，并交给后端处理。"""
         if event.input.id != "command_input":
             return
 
-        user_input = event.value.strip()
-        if not user_input:
+        raw_value = event.value
+        if not raw_value.strip():
             return
+        user_input = raw_value.rstrip()
 
         input_widget = self._query_input()
         input_widget.add_to_history(user_input)

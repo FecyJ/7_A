@@ -147,6 +147,7 @@ class ToolAgent:
 - 如果使用 http_request，必须提供明确的 http/https URL；禁止尝试 localhost、内网地址或虚构私有接口。
 - 如果前一轮工具结果已经足够回答，优先 respond，不要无意义重复调用工具。
 - 如果用户想要实时天气、联网搜索、外部 API 等，而当前工具不支持，应 refuse 并说明原因。
+- 如果总控已经把任务拆成明确的产出型子任务（如读取文件后生成 README、整理说明文档、基于已有文件总结结果），应直接完成当前子任务；不要停留在“先检查一下、再继续下一步”的半成品状态。
 
 【总控路由结果】
 - 原始用户输入: {user_input}
@@ -557,6 +558,21 @@ class ToolAgent:
         payload = [observation.to_prompt_dict() for observation in observations]
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    @staticmethod
+    def _build_llm_user_prompt(user_input: str, routed_task: ToolPlan) -> str:
+        task_description = str(routed_task.get("task_description") or "").strip()
+        context_passed = [str(item).strip() for item in list(routed_task.get("context_passed") or []) if str(item).strip()]
+
+        lines: list[str] = []
+        if user_input.strip():
+            lines.append(f"原始请求/当前输入：{user_input.strip()}")
+        if task_description and task_description != user_input.strip():
+            lines.append(f"当前子任务：{task_description}")
+        if context_passed:
+            context_text = "\n".join(f"- {item}" for item in context_passed[:10])
+            lines.append(f"补充上下文：\n{context_text}")
+        return "\n\n".join(line for line in lines if line.strip()) or task_description or user_input
+
     def _plan_action(
         self,
         user_input: str,
@@ -576,7 +592,7 @@ class ToolAgent:
             available_tools=self._tool_prompt_payload(tools),
             observations=self._observation_payload(observations),
         )
-        user_prompt = routed_task.get("task_description", user_input)
+        user_prompt = self._build_llm_user_prompt(user_input, routed_task)
 
         try:
             raw_text = generate_text_response(

@@ -732,25 +732,90 @@ class OrchestratorAgent:
 
     def _build_subtask_context(
         self,
+        user_input: str,
+        overall_task_description: str,
+        agent: str,
+        task_description: str,
         subtask: dict[str, Any],
         execution_context: dict[str, Any],
         global_context: list[str] | None = None,
     ) -> list[str]:
-        context_passed = [str(item) for item in list(global_context or []) if str(item).strip()]
+        context_passed = [
+            f"原始用户请求：{self._clip_block(user_input, 600)}",
+        ]
+        if overall_task_description and overall_task_description.strip() and overall_task_description.strip() != user_input.strip():
+            context_passed.append(f"整体任务摘要：{self._clip_block(overall_task_description, 500)}")
+
+        context_passed.extend(str(item) for item in list(global_context or []) if str(item).strip())
         context_passed.extend(
             [
-            self._replace_execution_placeholders(str(item), execution_context)
-            for item in list(subtask.get("context_passed") or [])
-            if str(item).strip()
+                self._replace_execution_placeholders(str(item), execution_context)
+                for item in list(subtask.get("context_passed") or [])
+                if str(item).strip()
             ]
         )
         last_result = str(execution_context.get("last_result") or "").strip()
         last_path = str(execution_context.get("last_path") or "").strip()
         if last_result:
-            context_passed.append(f"上一子任务结果摘要：{last_result}")
+            context_passed.append(f"上一子任务结果摘要：{self._clip_block(last_result, 500)}")
         if last_path:
             context_passed.append(f"上一子任务文件路径：{last_path}")
-        return context_passed
+
+        if agent == "shell_agent":
+            lowered = "\n".join([user_input, overall_task_description, task_description]).lower()
+            if any(
+                marker in lowered
+                for marker in [
+                    "html",
+                    "readme",
+                    ".md",
+                    "实现",
+                    "编写",
+                    "创建",
+                    "新建",
+                    "生成",
+                    "游戏",
+                    "页面",
+                    "代码",
+                ]
+            ):
+                context_passed.append(
+                    "执行要求：这是明确的产出型子任务，请直接完成文件创建/修改并产出最终结果；不要只做环境检查、列计划，或停留在“请继续下一步”。"
+                )
+                if any(marker in lowered for marker in ["简单", "demo", "示例", "小游戏", "原型"]):
+                    context_passed.append(
+                        "设计要求：若用户只要求“简单/示例/原型”效果，可自行做合理默认设计，不要因细节未指定而反复澄清。"
+                    )
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in context_passed:
+            normalized = " ".join(str(item).split())
+            if not normalized or normalized in seen:
+                continue
+            deduped.append(str(item).strip())
+            seen.add(normalized)
+        return deduped
+
+    def _compose_subtask_user_input(
+        self,
+        *,
+        user_input: str,
+        overall_task_description: str,
+        agent: str,
+        task_description: str,
+        context_passed: list[str],
+    ) -> str:
+        lines = [f"原始用户请求：{self._clip_block(user_input, 600)}"]
+        if overall_task_description and overall_task_description.strip() and overall_task_description.strip() != user_input.strip():
+            lines.append(f"整体任务摘要：{self._clip_block(overall_task_description, 500)}")
+        lines.append(f"当前子任务（{agent}）：{self._clip_block(task_description, 600)}")
+
+        if context_passed:
+            context_preview = "\n".join(f"- {self._clip_block(item, 240)}" for item in context_passed[:8])
+            lines.append(f"补充上下文：\n{context_preview}")
+
+        return "\n\n".join(line for line in lines if line.strip())
 
     @staticmethod
     def _should_stop_subtasks(status: str) -> bool:
@@ -844,12 +909,17 @@ class OrchestratorAgent:
             "step_results": [],
         }
         step_results: list[dict[str, Any]] = []
+        overall_task_description = str(routed_task.get("task_description") or "").strip()
 
         for index, subtask in enumerate(subtasks, start=1):
             agent = str(subtask.get("agent") or "").strip()
             raw_task_description = str(subtask.get("task_description") or "").strip()
             task_description = self._replace_execution_placeholders(raw_task_description, execution_context)
             context_passed = self._build_subtask_context(
+                user_input,
+                overall_task_description,
+                agent,
+                task_description,
                 subtask,
                 execution_context,
                 global_context=list(routed_task.get("context_passed") or []),
@@ -862,8 +932,15 @@ class OrchestratorAgent:
                 "risk_level": risk_level,
                 "task_description": task_description,
                 "context_passed": context_passed,
+                "overall_task_description": overall_task_description,
             }
-            subtask_input = task_description or user_input
+            subtask_input = self._compose_subtask_user_input(
+                user_input=user_input,
+                overall_task_description=overall_task_description,
+                agent=agent,
+                task_description=task_description or user_input,
+                context_passed=context_passed,
+            )
 
             if agent == "shell_agent":
                 step_result = await self._handle_shell_agent(subtask_input, step_task, ui)

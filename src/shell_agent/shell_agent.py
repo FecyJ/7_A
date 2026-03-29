@@ -143,6 +143,11 @@ class ShellAgent:
 3. intent="refuse"
    - 当请求危险、破坏性强、越权、或你无法安全完成时使用。
 
+补充执行规则：
+- 如果任务已经明确要求“创建/修改文件、实现代码、编写 HTML/CSS/JS、生成 README/文档”，应优先一次性生成能直接产出最终文件的命令。
+- 不要把明确的产出型任务降级成“先看一眼目录 / 先检查文件 / 请继续下一步”的探索性命令，除非确实缺少关键路径或目标文件名。
+- 对“简单示例 / demo / 原型 / 小游戏”这类请求，只要技术栈、目录和目标基本明确，就可以自行采用合理默认设计，不要反复追问 UI 细节。
+
 风险定义：
 - low: 查询/读取类操作，如 ls、pwd、find、cat、grep。
 - medium: 会创建/修改普通文件或目录，如 mkdir、touch、cp、mv。
@@ -377,6 +382,31 @@ class ShellAgent:
             "output_mode": None,
         }
 
+    @staticmethod
+    def _build_llm_user_prompt(user_input: str, routed_task: ShellPlan) -> str:
+        task_description = str(routed_task.get("task_description") or "").strip()
+        context_passed = [str(item).strip() for item in list(routed_task.get("context_passed") or []) if str(item).strip()]
+
+        lines: list[str] = []
+        if user_input.strip():
+            lines.append(f"原始请求/当前输入：{user_input.strip()}")
+        if task_description and task_description != user_input.strip():
+            lines.append(f"当前子任务：{task_description}")
+        if context_passed:
+            context_text = "\n".join(f"- {item}" for item in context_passed[:10])
+            lines.append(f"补充上下文：\n{context_text}")
+
+        combined = "\n".join(filter(None, [user_input, task_description, "\n".join(context_passed)])).lower()
+        if any(
+            marker in combined
+            for marker in ["实现", "编写", "创建", "新建", "生成", "html", "readme", ".md", "代码", "页面", "游戏"]
+        ):
+            lines.append(
+                "执行要求：请直接生成可执行命令以完成当前子任务并产出最终文件/结果；若信息已足够，不要只给出检查环境或要求继续下一步的命令。"
+            )
+
+        return "\n\n".join(line for line in lines if line.strip()) or task_description or user_input
+
     def plan_command(self, user_input: str, routed_task: ShellPlan) -> ShellPlan:
         context = self._runtime_context()
         system_prompt = self.SYSTEM_PROMPT.format(
@@ -387,11 +417,12 @@ class ShellAgent:
             orchestrator_risk_level=routed_task.get("risk_level", "low"),
             **context,
         )
+        user_prompt = self._build_llm_user_prompt(user_input, routed_task)
 
         try:
             raw_text = generate_text_response(
                 system_prompt,
-                routed_task.get("task_description", user_input),
+                user_prompt,
                 llm_client=self.llm_client,
                 model=self.model,
                 temperature=0.1,
@@ -880,8 +911,8 @@ class ShellAgent:
                 task_description=str(working_task.get("task_description", working_input)),
                 command=command,
             )
-            if output_mode == "capture":
-                self._emit_workflow(ui, "该命令将以静默模式执行，原始输出不会直接展示", state="info")
+            # if output_mode == "capture":
+            #     self._emit_workflow(ui, "该命令将以静默模式执行，原始输出不会直接展示", state="info")
             reviewed = await self._review_and_execute_command(
                 command,
                 ui,

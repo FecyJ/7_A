@@ -12,6 +12,8 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Input, Static
 
+from .command_input import CommandInput
+
 
 class InteractionPanel(Vertical, can_focus=True):
     """显示在日志区和输入框之间的正式 TUI 交互面板。"""
@@ -275,7 +277,7 @@ class InteractionPanel(Vertical, can_focus=True):
         self.refresh(layout=True)
 
         try:
-            self.app.query_one("#command_input", Input).focus()
+            self.app.query_one("#command_input", CommandInput).focus()
         except Exception:
             pass
 

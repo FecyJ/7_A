@@ -65,6 +65,7 @@ class AgentRichLog(RichLog):
         kwargs.setdefault("highlight", False)
         kwargs.setdefault("markup", False)
         kwargs.setdefault("wrap", True)
+        kwargs.setdefault("min_width", 1)
         super().__init__(*args, **kwargs)
         # 高亮器
         self.llm_highlighter = ReprHighlighter()
@@ -458,7 +459,7 @@ class AgentRichLog(RichLog):
         """为 agent 输出加上前导 bullet。"""
         table = Table.grid(expand=True, padding=(0, 1))
         table.add_column(width=1, no_wrap=True)
-        table.add_column(ratio=1)
+        table.add_column(ratio=1, overflow="fold")
         table.add_row(Text("•", style="color(245)"), renderable)
         return table
 

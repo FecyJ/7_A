@@ -229,14 +229,13 @@ def get_system_prompt(context: dict[str, str], extra_context: dict[str, str] | N
    - 示例："读取 config.json 并总结里面的数据库配置"、"分析这段代码的复杂度"。
    - 强规则：凡是“先读取文件/代码/文档内容，再总结、分析、解释、翻译”的任务，一律优先判为 "tool_agent"。
    - 强规则：凡是“当前时间/日期/星期、天气、新闻、汇率、最新/实时数据”等依赖实时信息的问题，不允许判为 "direct_answer"，应交给可获取实时信息的 Agent。
-3. "memory_agent": 显式的长期记忆读写请求。
-   - 示例："记住我最喜欢的语言是 Python"、"你还记得我的默认开发语言吗"、"列出记忆"。
-4. "multi_agent": 一个请求天然包含两个及以上子任务，需要拆成顺序执行的多个 A2A 子任务。
-   - 示例："用我最喜欢的语言写一个 Hello World，并记住这个文件路径。"
-   - 强规则：凡是“实现代码 / 写文件 / 生成网页 / 补 README / 在某目录下完成一个 demo 或小游戏”这类落地开发请求，优先判为 "multi_agent"，不要直接判为 shell_agent。
-5. "direct_answer": 纯知识问答或闲聊，无需系统执行任何操作。
+3. "direct_answer": 纯知识问答或闲聊，无需系统执行任何操作。
    - 示例："什么是 Python 的 GIL？"、"多 Agent 系统怎么设计？"
    - 禁止场景：不要把“现在几点了”“今天天气”“最新新闻”“美元兑人民币汇率”等时效性问题判为 direct_answer。
+4. "memory_agent": 显式的长期记忆读写请求。
+   - 示例："记住我最喜欢的语言是 Python"、"你还记得我的默认开发语言吗"、"列出记忆"。
+5. "multi_agent": 一个请求天然包含两个及以上子任务，需要拆成顺序执行的多个 A2A 子任务。
+   - 示例："用我最喜欢的语言写一个 Hello World，并记住这个文件路径。"
 6. "clarification": (最高优先级) 指令模糊或存在安全隐患，必须追问。
    - 边界：存在你认为无从确定的模糊指代；或者用户要求操作的实体在【当前环境上下文】中不存在并且你无法推断其含义；或者操作极度危险但意图不明。
 
@@ -554,111 +553,6 @@ def _looks_like_semantic_file_task(*texts: str) -> bool:
     return any(marker in combined for marker in file_markers) and any(
         marker in combined for marker in semantic_markers
     )
-
-
-def _looks_like_code_generation_request(*texts: str) -> bool:
-    """识别“实现代码 / 写文件 / 补 README”类落地开发请求。"""
-    combined = "\n".join(text for text in texts if text)
-    lowered = combined.lower()
-    if not lowered:
-        return False
-
-    implement_markers = [
-        "实现",
-        "编写",
-        "写一个",
-        "写个",
-        "写入",
-        "写到",
-        "写文件",
-        "生成",
-        "创建",
-        "开发",
-        "构建",
-        "搭建",
-        "补",
-        "补上",
-        "完善",
-        "完成",
-    ]
-    code_target_markers = [
-        "代码",
-        "程序",
-        "脚本",
-        "页面",
-        "网页",
-        "html",
-        "css",
-        "javascript",
-        "js",
-        "python",
-        "小游戏",
-        "游戏",
-        "demo",
-        "组件",
-        "前端",
-        "项目",
-        "2048",
-    ]
-    file_target_markers = [
-        "文件",
-        "目录",
-        "readme",
-        "README",
-        "运行方式",
-        "使用说明",
-        ".py",
-        ".html",
-        ".js",
-        ".css",
-        ".md",
-        ".json",
-        ".txt",
-    ]
-    path_like_pattern = re.search(r"(?:^|[\s(（])[\w./-]+/[\w./-]*", combined)
-
-    has_implement = any(marker in combined for marker in implement_markers)
-    has_code_target = any(marker in lowered for marker in code_target_markers)
-    has_file_target = any(marker.lower() in lowered for marker in file_target_markers) or bool(path_like_pattern)
-    has_readme = "readme" in lowered or "运行方式" in combined or "使用说明" in combined
-
-    return (has_implement and has_code_target) or (has_implement and has_readme) or (has_code_target and has_file_target)
-
-
-def _build_code_generation_multi_agent(user_input: str) -> IntentResult:
-    """为落地开发请求构造固定的 multi_agent 流程：先规划，再写入。"""
-    return {
-        "reasoning": "检测到这是“实现代码/写文件/补 README”类落地开发请求，按规则强制改路由为 multi_agent：先由 tool_agent 规划，再由 shell_agent 实际创建/修改文件。",
-        "confidence": 0.92,
-        "intent": "multi_agent",
-        "risk_level": "medium",
-        "task_description": "先规划文件实现方案，再在目标目录中实际落地代码与 README。",
-        "context_passed": [f"用户原始请求：{user_input}"],
-        "reply": None,
-        "question": None,
-        "options": None,
-        "subtasks": [
-            {
-                "agent": "tool_agent",
-                "task_description": "分析用户的开发请求，结合当前工作区，给出需要创建/修改的文件清单、实现方案、关键代码结构，以及 README 中应包含的运行方式。",
-                "context_passed": [f"用户原始请求：{user_input}"],
-                "risk_level": "low",
-                "memory_action": None,
-                "memory_content": None,
-            },
-            {
-                "agent": "shell_agent",
-                "task_description": "根据用户原始请求和上一步方案，在目标目录中实际创建或修改所需文件并写入内容；若请求包含 README 或运行方式说明，也一并补全。完成后输出创建/修改的文件列表与简要结果。",
-                "context_passed": [
-                    "用户原始请求：{{user_input}}",
-                    "上一步方案：{{last_result}}",
-                ],
-                "risk_level": "medium",
-                "memory_action": None,
-                "memory_content": None,
-            },
-        ],
-    }
 
 
 def _detect_memory_request(user_input: str) -> dict[str, str] | None:
@@ -1209,21 +1103,13 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
     intent = result.get("intent")
     task_description = str(result.get("task_description") or "")
     subtasks = result.get("subtasks")
-    memory_request = _detect_memory_request(user_input)
-
-    if _looks_like_code_generation_request(user_input, task_description):
-        codegen_result = _build_code_generation_multi_agent(user_input)
-        if memory_request is not None:
-            codegen_result["subtasks"] = list(codegen_result.get("subtasks") or []) + [
-                _build_memory_subtask(memory_request)
-            ]
-        return codegen_result
 
     collapsed = _collapse_single_subtask_multi_agent(user_input, result)
     if collapsed is not None:
         return collapsed
 
     temporal_query_info = _detect_temporal_query(user_input, task_description)
+    memory_request = _detect_memory_request(user_input)
 
     if memory_request is not None and not subtasks:
         if intent in {"shell_agent", "tool_agent"} and _looks_like_compound_request(user_input):

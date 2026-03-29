@@ -199,17 +199,26 @@ class AgentRichLog(RichLog):
         state.line_count = len(strips)
         state.frame += 1
 
-    def write_workflow_message(self, content: str, state: str = "info") -> None:
+    def write_workflow_message(
+        self,
+        content: str,
+        state: str = "info",
+        *,
+        animate: bool | None = None,
+    ) -> None:
         """输出流程状态日志。"""
         self._stop_workflow_animation()
         self._prepare_entry("workflow")
 
-        text = self._build_workflow_text(content, state, animated=(state == "running"))
+        if animate is None:
+            animate = state == "running"
+
+        text = self._build_workflow_text(content, state, animated=animate)
         start_line = len(self.lines) if self._size_known else 0
         self.write(text)
         self._last_entry_kind = "workflow"
 
-        if state == "running" and self._size_known:
+        if animate and state == "running" and self._size_known:
             line_count = max(1, len(self.lines) - start_line)
             self._workflow_animation = _WorkflowAnimationState(
                 start_line=start_line,

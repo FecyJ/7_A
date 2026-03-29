@@ -263,6 +263,73 @@ class ToolAgent:
         return cleaned.strip()
 
     @classmethod
+    def _normalize_weather_location_candidate(cls, value: str) -> str | None:
+        """清洗天气查询里抽取出的地点候选，避免把整句或时间词误当地点。"""
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return None
+
+        prefix_pattern = (
+            r"^(?:请告诉我|告诉我|帮我|请问|请你|请|麻烦你|麻烦|给出|给我|查一下|查查|查询一下|查询|"
+            r"看看|看下|获取一下|获取|联网查找|联网搜索|搜索|检索|给我查下|给我查查|给我看看)\s*"
+        )
+        temporal_pattern = r"(?:现在|当前|今天|明天|后天|实时|最新|此刻|目前)"
+
+        for _ in range(6):
+            previous = cleaned
+            cleaned = re.sub(prefix_pattern, "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(rf"^{temporal_pattern}\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(rf"\s*{temporal_pattern}$", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*的\s*$", "", cleaned)
+            cleaned = re.sub(r"\s*(?:那边|那里|这边|这里|本地|当地)\s*$", "", cleaned)
+            cleaned = cleaned.strip(" ，。,:：?？!！")
+            if cleaned == previous:
+                break
+
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return None
+
+        normalized = cleaned.lower().replace(" ", "")
+        invalid_values = {
+            "现在",
+            "当前",
+            "今天",
+            "明天",
+            "后天",
+            "实时",
+            "最新",
+            "现在的",
+            "当前的",
+            "今天的",
+            "天气",
+            "气温",
+            "温度",
+            "本地",
+            "当地",
+            "这里",
+            "这边",
+            "那里",
+            "那边",
+            "weather",
+            "目标地点",
+            "目标城市",
+            "目标地区",
+            "目标区域",
+            "指定地点",
+            "指定城市",
+            "指定地区",
+            "城市",
+            "地区",
+            "区域",
+            "地点",
+        }
+        if normalized in invalid_values:
+            return None
+
+        return cleaned
+
+    @classmethod
     def _extract_weather_location(cls, *texts: str) -> str | None:
         patterns = [
             r"(.{1,20}?)(?:今天|明天|后天|当前|现在|实时)?(?:天气|气温|温度)",
@@ -274,7 +341,7 @@ class ToolAgent:
                 continue
             for pattern in patterns:
                 for match in re.findall(pattern, text, flags=re.IGNORECASE):
-                    candidate = cls._clean_extracted_fragment(match)
+                    candidate = cls._normalize_weather_location_candidate(match)
                     if (
                         candidate
                         and len(candidate) >= 2
@@ -681,6 +748,21 @@ class ToolAgent:
         )
 
     @staticmethod
+    def _synthesis_workflow_text(observations: list[ToolObservation]) -> str:
+        """为最终整理回答阶段提供简洁的运行中提示。"""
+        if not observations:
+            return "正在整理结果..."
+
+        last_tool = observations[-1].tool_name
+        if last_tool == "read_file":
+            return "正在归纳文档内容..."
+        if last_tool in {"get_news", "http_request"}:
+            return "正在整理检索结果..."
+        if last_tool in {"get_weather", "get_exchange_rate", "get_current_time", "get_live_time"}:
+            return "正在整理查询结果..."
+        return "正在整理工具结果..."
+
+    @staticmethod
     def _extract_json_payload(observation: ToolObservation) -> dict[str, Any] | None:
         try:
             payload = json.loads(observation.result)
@@ -802,7 +884,7 @@ class ToolAgent:
         if self._detect_temporal_category(user_input, task_description, combined_context) != "weather":
             return None
 
-        location = self._extract_weather_location(user_input, task_description, combined_context)
+        location = self._extract_weather_location(user_input, combined_context)
         if not location:
             return {
                 "intent": "ask_clarification",
@@ -1026,9 +1108,9 @@ class ToolAgent:
             self._emit_workflow(ui, f"工具返回错误：{self._shorten_text(observation.result)}", state="warn")
             return None
 
-        self._emit_workflow(ui, f"工具返回：{self._shorten_text(observation.result)}", state="info")
+        # self._emit_workflow(ui, f"工具返回：{self._shorten_text(observation.result)}", state="info")
+        self._emit_workflow(ui, self._synthesis_workflow_text([observation]), state="running")
         final_answer = await asyncio.to_thread(self._synthesize_answer, user_input, [observation])
-        self._emit_workflow(ui, "正在整理工具结果...", state="running")
         await ui.stream_llm(final_answer)
         return {
             "intent": "respond",
@@ -1182,8 +1264,8 @@ class ToolAgent:
                 observations.append(observation)
                 if observation.is_error:
                     self._emit_workflow(ui, f"工具返回错误：{self._shorten_text(observation.result)}", state="warn")
-                else:
-                    self._emit_workflow(ui, f"工具返回：{self._shorten_text(observation.result)}", state="info")
+                # else:
+                    # self._emit_workflow(ui, f"工具返回：{self._shorten_text(observation.result)}", state="info")
 
                 if planned_signature == last_tool_signature:
                     repeated_tool_calls += 1
@@ -1197,6 +1279,7 @@ class ToolAgent:
                     break
 
             self._emit_workflow(ui, summary_reason, state="warn")
+            self._emit_workflow(ui, self._synthesis_workflow_text(observations), state="running")
             final_answer = await asyncio.to_thread(self._synthesize_answer, working_input, observations)
             await ui.stream_llm(final_answer)
             return {

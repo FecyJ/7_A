@@ -34,6 +34,42 @@ except ImportError:
 client = get_llm_client()
 IntentResult = dict[str, Any]
 INTENT_JSON_SCHEMA_NAME = "intent_routing_result"
+SUBTASK_JSON_SCHEMA = {
+    "type": "object",
+    "required": [
+        "agent",
+        "task_description",
+        "context_passed",
+        "risk_level",
+        "memory_action",
+        "memory_content",
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "agent": {
+            "type": "string",
+            "enum": ["shell_agent", "tool_agent", "memory_agent"],
+        },
+        "task_description": {"type": "string"},
+        "context_passed": {"type": "array", "items": {"type": "string"}},
+        "risk_level": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+        },
+        "memory_action": {
+            "anyOf": [
+                {"type": "string", "enum": ["save", "search", "delete", "list"]},
+                {"type": "null"},
+            ]
+        },
+        "memory_content": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
+    },
+}
 
 # === 1. JSON Schema 定义（用于 jsonschema 校验）===
 INTENT_JSON_SCHEMA = {
@@ -48,6 +84,7 @@ INTENT_JSON_SCHEMA = {
         "reply",
         "question",
         "options",
+        "subtasks",
     ],
     "additionalProperties": False,
     "properties": {
@@ -55,7 +92,7 @@ INTENT_JSON_SCHEMA = {
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "intent": {
             "type": "string",
-            "enum": ["shell_agent", "tool_agent", "direct_answer", "clarification"],
+            "enum": ["shell_agent", "tool_agent", "memory_agent", "multi_agent", "direct_answer", "clarification"],
         },
         "risk_level": {
             "type": "string",
@@ -88,6 +125,12 @@ INTENT_JSON_SCHEMA = {
         "options": {
             "anyOf": [
                 {"type": "array", "items": {"type": "string"}},
+                {"type": "null"},
+            ]
+        },
+        "subtasks": {
+            "anyOf": [
+                {"type": "array", "items": SUBTASK_JSON_SCHEMA},
                 {"type": "null"},
             ]
         },
@@ -129,7 +172,42 @@ def get_advanced_context() -> dict[str, str]:
 
 
 # === 3. System Prompt 生成 ===
-def get_system_prompt(context: dict[str, str]) -> str:
+def _format_extra_context(extra_context: dict[str, str] | None) -> str:
+    """格式化 RAM / ROM 附加上下文。"""
+    if not extra_context:
+        return ""
+
+    sections: list[str] = []
+    short_term = str(extra_context.get("short_term_memory") or "").strip()
+    long_term = str(extra_context.get("long_term_memory") or "").strip()
+
+    if short_term:
+        sections.append(f"""【短期会话上下文（RAM）】
+以下是最近几轮对话摘要，请用它解决“那个文件 / 上一步结果 / 刚才提到的路径”等代词指代问题：
+{short_term}""")
+
+    if long_term:
+        sections.append(f"""【长期记忆注入（ROM）】
+以下是从持久化记忆库检索出的背景事实 / 用户偏好，请在规划任务时优先参考：
+{long_term}""")
+
+    last_file_path = str(extra_context.get("last_file_path") or "").strip()
+    last_document_summary = str(extra_context.get("last_document_summary") or "").strip()
+    last_document_content = str(extra_context.get("last_document_content") or "").strip()
+    if last_file_path or last_document_summary or last_document_content:
+        lines = ["【最近文档 Artifact】", "如果用户提到“前文所述 / 刚才那个 README / 该文档 / 这个文件”，默认优先指向以下最近一次成功读取/分析的文档："]
+        if last_file_path:
+            lines.append(f"- 最近文档路径: {last_file_path}")
+        if last_document_summary:
+            lines.append(f"- 最近文档摘要: {last_document_summary}")
+        if last_document_content:
+            lines.append(f"- 最近文档内容片段:\n{last_document_content}")
+        sections.append("\n".join(lines))
+
+    return ("\n\n" + "\n\n".join(sections)) if sections else ""
+
+
+def get_system_prompt(context: dict[str, str], extra_context: dict[str, str] | None = None) -> str:
     """生成带环境上下文的系统提示词，要求 LLM 输出结构化 JSON。"""
     return f"""你是一个多 Agent 命令行系统的"总控大脑"。你的唯一任务是分析用户的自然语言输入，判断其真实意图，并输出严格的结构化 JSON 进行路由。
 
@@ -140,7 +218,7 @@ def get_system_prompt(context: dict[str, str]) -> str:
 - 目录概览 (前20项):
 {context['files']}
 - Git 状态:
-{context['git_status']}
+{context['git_status']}{_format_extra_context(extra_context)}
 
 【意图分类标准与边界】
 1. "shell_agent": 确定性的本地系统操作。
@@ -151,11 +229,25 @@ def get_system_prompt(context: dict[str, str]) -> str:
    - 示例："读取 config.json 并总结里面的数据库配置"、"分析这段代码的复杂度"。
    - 强规则：凡是“先读取文件/代码/文档内容，再总结、分析、解释、翻译”的任务，一律优先判为 "tool_agent"。
    - 强规则：凡是“当前时间/日期/星期、天气、新闻、汇率、最新/实时数据”等依赖实时信息的问题，不允许判为 "direct_answer"，应交给可获取实时信息的 Agent。
-3. "direct_answer": 纯知识问答或闲聊，无需系统执行任何操作。
+3. "memory_agent": 显式的长期记忆读写请求。
+   - 示例："记住我最喜欢的语言是 Python"、"你还记得我的默认开发语言吗"、"列出记忆"。
+4. "multi_agent": 一个请求天然包含两个及以上子任务，需要拆成顺序执行的多个 A2A 子任务。
+   - 示例："用我最喜欢的语言写一个 Hello World，并记住这个文件路径。"
+   - 强规则：凡是“实现代码 / 写文件 / 生成网页 / 补 README / 在某目录下完成一个 demo 或小游戏”这类落地开发请求，优先判为 "multi_agent"，不要直接判为 shell_agent。
+5. "direct_answer": 纯知识问答或闲聊，无需系统执行任何操作。
    - 示例："什么是 Python 的 GIL？"、"多 Agent 系统怎么设计？"
    - 禁止场景：不要把“现在几点了”“今天天气”“最新新闻”“美元兑人民币汇率”等时效性问题判为 direct_answer。
-4. "clarification": (最高优先级) 指令模糊或存在安全隐患，必须追问。
+6. "clarification": (最高优先级) 指令模糊或存在安全隐患，必须追问。
    - 边界：存在你认为无从确定的模糊指代；或者用户要求操作的实体在【当前环境上下文】中不存在并且你无法推断其含义；或者操作极度危险但意图不明。
+
+【子任务拆分规则】
+- 如果一个请求只需一个下级 Agent，就使用对应单一 intent。
+- 如果一个请求同时包含“执行任务 + 记住结果 / 再查询别的资源”等多个动作，优先输出 intent="multi_agent"，并在 subtasks 中按执行顺序拆分。
+- intent="multi_agent" 时，subtasks 至少要有 2 项；如果只有 1 项，说明这不是 multi_agent。
+- subtasks 中每一项的 agent 只能是：shell_agent / tool_agent / memory_agent。
+- memory_agent 子任务必须填写 memory_action（save/search/delete/list）；如果要引用上一步结果，可在 memory_content 中使用占位符：
+  - {{last_result}}：上一子任务的结果摘要
+  - {{last_path}}：上一子任务解析出的文件路径
 
 【评估与校准规则】
 你必须进行以下两项严格评估：
@@ -168,19 +260,51 @@ def get_system_prompt(context: dict[str, str]) -> str:
 为了彻底消除“事后合理化”的幻觉，你必须严格按照以下自回归逻辑链顺序输出字段：
 先输出 reasoning (思考推演) -> 再输出 confidence (严格打分) -> 接着输出 intent (根据reasoning和confidence定论) -> 然后是 risk_level -> 最后动态输出专属字段。
 
-请根据最终确定的 intent，选择以下三种 JSON 结构之一进行输出：
+请根据最终确定的 intent，选择以下几种 JSON 结构之一进行输出：
 
->>> 如果 intent 是 "shell_agent" 或 "tool_agent"：
+>>> 如果 intent 是 "shell_agent"、"tool_agent" 或 "memory_agent"：
 {{
     "reasoning": "分析用户指令 -> 检查上下文文件是否存在 -> 评估风险 -> 决定委派给下级 Agent",
     "confidence": 0.95,
-    "intent": "shell_agent" | "tool_agent",
+    "intent": "shell_agent" | "tool_agent" | "memory_agent",
     "risk_level": "low" | "medium" | "high",
     "task_description": "将用户的话转化为专业、清晰的任务指令，提供给下级 Agent",
     "context_passed": ["提取出的文件名、路径或关键参数"],
     "reply": null,
     "question": null,
-    "options": null
+    "options": null,
+    "subtasks": null
+}}
+
+>>> 如果 intent 是 "multi_agent"：
+{{
+    "reasoning": "识别到这是复合请求，需要拆成多个 A2A 子任务顺序执行",
+    "confidence": 0.92,
+    "intent": "multi_agent",
+    "risk_level": "low" | "medium" | "high",
+    "task_description": "对复合请求的整体摘要",
+    "context_passed": ["对整体请求有帮助的关键上下文"],
+    "reply": null,
+    "question": null,
+    "options": null,
+    "subtasks": [
+        {{
+            "agent": "shell_agent" | "tool_agent" | "memory_agent",
+            "task_description": "该子任务的清晰说明",
+            "context_passed": ["传给该子任务的参数"],
+            "risk_level": "low" | "medium" | "high",
+            "memory_action": null | "save" | "search" | "delete" | "list",
+            "memory_content": null | "要写入/查询的记忆内容，支持 {{last_result}} / {{last_path}}"
+        }},
+        {{
+            "agent": "shell_agent" | "tool_agent" | "memory_agent",
+            "task_description": "第二个及之后的子任务说明",
+            "context_passed": ["可引用上一步结果"],
+            "risk_level": "low" | "medium" | "high",
+            "memory_action": null | "save" | "search" | "delete" | "list",
+            "memory_content": null | "要写入/查询的记忆内容，支持 {{last_result}} / {{last_path}}"
+        }}
+    ]
 }}
 
 >>> 如果 intent 是 "direct_answer"：
@@ -193,7 +317,8 @@ def get_system_prompt(context: dict[str, str]) -> str:
     "context_passed": null,
     "reply": "直接在这里写出完整的回答内容，一步到位",
     "question": null,
-    "options": null
+    "options": null,
+    "subtasks": null
 }}
 
 >>> 如果 intent 是 "clarification"：
@@ -206,7 +331,8 @@ def get_system_prompt(context: dict[str, str]) -> str:
     "context_passed": null,
     "reply": null,
     "question": "向用户提出礼貌的追问，例如：请问您要删除的是当前目录的 test.py 还是 src 目录下的？",
-    "options": ["候选选项1", "候选选项2", "其他"]
+    "options": ["候选选项1", "候选选项2", "其他"],
+    "subtasks": null
 }}
 """
 
@@ -261,22 +387,42 @@ def validate_intent_result(data: IntentResult) -> tuple[bool, str]:
         if data["confidence"] < CONFIDENCE_LOW and data["intent"] != "clarification":
             return False, "confidence < 0.5 时 intent 必须为 clarification"
         intent = data["intent"]
+        subtasks = data.get("subtasks")
+
+        if subtasks is not None:
+            if not isinstance(subtasks, list) or not subtasks:
+                return False, "subtasks 必须为非空数组或 null"
+            for index, subtask in enumerate(subtasks, start=1):
+                if not isinstance(subtask, dict):
+                    return False, f"subtasks[{index}] 不是对象"
+                if subtask["agent"] == "memory_agent" and subtask.get("memory_action") is None:
+                    return False, f"subtasks[{index}] 的 memory_agent 必须提供 memory_action"
 
         if intent == "direct_answer":
             if data["risk_level"] != "low":
                 return False, "direct_answer 的 risk_level 必须为 low"
             if not isinstance(data.get("reply"), str) or not data["reply"].strip():
                 return False, "direct_answer 必须提供非空 reply"
+            if subtasks is not None:
+                return False, "direct_answer 不能携带 subtasks"
         elif intent == "clarification":
             if not isinstance(data.get("question"), str) or not data["question"].strip():
                 return False, "clarification 必须提供非空 question"
             if not isinstance(data.get("options"), list):
                 return False, "clarification 必须提供 options 列表"
-        elif intent in {"shell_agent", "tool_agent"}:
-            if not isinstance(data.get("task_description"), str) or not data["task_description"].strip():
-                return False, f"{intent} 必须提供非空 task_description"
-            if not isinstance(data.get("context_passed"), list):
-                return False, f"{intent} 必须提供 context_passed 列表"
+            if subtasks is not None:
+                return False, "clarification 不能携带 subtasks"
+        elif intent in {"shell_agent", "tool_agent", "memory_agent"}:
+            if subtasks is None:
+                if not isinstance(data.get("task_description"), str) or not data["task_description"].strip():
+                    return False, f"{intent} 必须提供非空 task_description"
+                if not isinstance(data.get("context_passed"), list):
+                    return False, f"{intent} 必须提供 context_passed 列表"
+        elif intent == "multi_agent":
+            if subtasks is None:
+                return False, "multi_agent 必须提供 subtasks"
+            if len(subtasks) < 2:
+                return False, "multi_agent 至少需要 2 个子任务"
 
         return True, ""
     except ValidationError as exc:
@@ -408,6 +554,298 @@ def _looks_like_semantic_file_task(*texts: str) -> bool:
     return any(marker in combined for marker in file_markers) and any(
         marker in combined for marker in semantic_markers
     )
+
+
+def _looks_like_code_generation_request(*texts: str) -> bool:
+    """识别“实现代码 / 写文件 / 补 README”类落地开发请求。"""
+    combined = "\n".join(text for text in texts if text)
+    lowered = combined.lower()
+    if not lowered:
+        return False
+
+    implement_markers = [
+        "实现",
+        "编写",
+        "写一个",
+        "写个",
+        "写入",
+        "写到",
+        "写文件",
+        "生成",
+        "创建",
+        "开发",
+        "构建",
+        "搭建",
+        "补",
+        "补上",
+        "完善",
+        "完成",
+    ]
+    code_target_markers = [
+        "代码",
+        "程序",
+        "脚本",
+        "页面",
+        "网页",
+        "html",
+        "css",
+        "javascript",
+        "js",
+        "python",
+        "小游戏",
+        "游戏",
+        "demo",
+        "组件",
+        "前端",
+        "项目",
+        "2048",
+    ]
+    file_target_markers = [
+        "文件",
+        "目录",
+        "readme",
+        "README",
+        "运行方式",
+        "使用说明",
+        ".py",
+        ".html",
+        ".js",
+        ".css",
+        ".md",
+        ".json",
+        ".txt",
+    ]
+    path_like_pattern = re.search(r"(?:^|[\s(（])[\w./-]+/[\w./-]*", combined)
+
+    has_implement = any(marker in combined for marker in implement_markers)
+    has_code_target = any(marker in lowered for marker in code_target_markers)
+    has_file_target = any(marker.lower() in lowered for marker in file_target_markers) or bool(path_like_pattern)
+    has_readme = "readme" in lowered or "运行方式" in combined or "使用说明" in combined
+
+    return (has_implement and has_code_target) or (has_implement and has_readme) or (has_code_target and has_file_target)
+
+
+def _build_code_generation_multi_agent(user_input: str) -> IntentResult:
+    """为落地开发请求构造固定的 multi_agent 流程：先规划，再写入。"""
+    return {
+        "reasoning": "检测到这是“实现代码/写文件/补 README”类落地开发请求，按规则强制改路由为 multi_agent：先由 tool_agent 规划，再由 shell_agent 实际创建/修改文件。",
+        "confidence": 0.92,
+        "intent": "multi_agent",
+        "risk_level": "medium",
+        "task_description": "先规划文件实现方案，再在目标目录中实际落地代码与 README。",
+        "context_passed": [f"用户原始请求：{user_input}"],
+        "reply": None,
+        "question": None,
+        "options": None,
+        "subtasks": [
+            {
+                "agent": "tool_agent",
+                "task_description": "分析用户的开发请求，结合当前工作区，给出需要创建/修改的文件清单、实现方案、关键代码结构，以及 README 中应包含的运行方式。",
+                "context_passed": [f"用户原始请求：{user_input}"],
+                "risk_level": "low",
+                "memory_action": None,
+                "memory_content": None,
+            },
+            {
+                "agent": "shell_agent",
+                "task_description": "根据用户原始请求和上一步方案，在目标目录中实际创建或修改所需文件并写入内容；若请求包含 README 或运行方式说明，也一并补全。完成后输出创建/修改的文件列表与简要结果。",
+                "context_passed": [
+                    "用户原始请求：{{user_input}}",
+                    "上一步方案：{{last_result}}",
+                ],
+                "risk_level": "medium",
+                "memory_action": None,
+                "memory_content": None,
+            },
+        ],
+    }
+
+
+def _detect_memory_request(user_input: str) -> dict[str, str] | None:
+    """识别显式的长期记忆读写请求。"""
+    text = user_input.strip()
+    if not text:
+        return None
+
+    save_triggers = ["记住", "记下", "保存记忆", "帮我记", "偏好", "偏向", "我的喜好是"]
+    search_triggers = ["你记得", "记得吗", "之前说过", "我说过什么", "你还记得", "回忆一下"]
+    delete_triggers = ["忘掉", "忘记", "删除记忆", "去掉记忆"]
+    list_triggers = ["所有记忆", "列出记忆", "查看记忆", "有哪些记忆"]
+
+    for trigger in save_triggers:
+        if trigger in text:
+            content = text.split(trigger, 1)[-1].strip() or text
+            return {"action": "save", "content": content, "trigger": trigger}
+
+    for trigger in search_triggers:
+        if trigger in text:
+            content = text.replace(trigger, "").strip() or text
+            return {"action": "search", "content": content, "trigger": trigger}
+
+    for trigger in delete_triggers:
+        if trigger in text:
+            content = text.split(trigger, 1)[-1].strip()
+            if not content:
+                return None
+            return {"action": "delete", "content": content, "trigger": trigger}
+
+    for trigger in list_triggers:
+        if trigger in text:
+            return {"action": "list", "content": "", "trigger": trigger}
+
+    return None
+
+
+def _looks_like_compound_request(user_input: str) -> bool:
+    """粗略识别多动作复合请求。"""
+    lowered = user_input.lower()
+    connectors = ["并", "并且", "同时", "然后", "再", "之后", "接着", "and then", " then ", " also "]
+    return any(connector in lowered for connector in connectors)
+
+
+def _uses_generic_memory_reference(content: str) -> bool:
+    lowered = content.strip().lower()
+    generic_markers = [
+        "这个",
+        "那个",
+        "它",
+        "该",
+        "刚才",
+        "上一步",
+        "上个结果",
+        "文件路径",
+        "这个文件路径",
+        "结果",
+        "路径",
+    ]
+    return any(marker in lowered for marker in generic_markers)
+
+
+def _memory_template_from_content(content: str) -> str:
+    cleaned = content.strip()
+    if not cleaned:
+        return "{{last_result}}"
+    if _uses_generic_memory_reference(cleaned):
+        if "路径" in cleaned or "文件" in cleaned:
+            return "{{last_path}}"
+        return "{{last_result}}"
+    return cleaned
+
+
+def _build_memory_subtask(memory_request: dict[str, str]) -> dict[str, Any]:
+    """将记忆请求映射为标准子任务。"""
+    action = memory_request["action"]
+    raw_content = memory_request.get("content", "").strip()
+    memory_content = _memory_template_from_content(raw_content)
+
+    task_description_map = {
+        "save": f"将以下信息写入长期记忆：{memory_content}",
+        "search": f"检索与“{raw_content or memory_content}”相关的长期记忆",
+        "delete": f"删除与“{raw_content or memory_content}”最相关的长期记忆",
+        "list": "列出当前长期记忆中的重要条目",
+    }
+    context_passed = [raw_content] if raw_content else []
+
+    return {
+        "agent": "memory_agent",
+        "task_description": task_description_map[action],
+        "context_passed": context_passed,
+        "risk_level": "low",
+        "memory_action": action,
+        "memory_content": memory_content if action != "list" else None,
+    }
+
+
+def _result_to_primary_subtask(result: IntentResult) -> dict[str, Any] | None:
+    """将单一 agent 路由结果转换为第一个子任务。"""
+    intent = result.get("intent")
+    if intent not in {"shell_agent", "tool_agent", "memory_agent"}:
+        return None
+    task_description = str(result.get("task_description") or "").strip()
+    if not task_description:
+        return None
+
+    memory_action = None
+    memory_content = None
+    if intent == "memory_agent":
+        memory_request = _detect_memory_request(task_description) or {"action": "save", "content": task_description}
+        memory_action = memory_request["action"]
+        memory_content = _memory_template_from_content(memory_request.get("content", ""))
+
+    return {
+        "agent": intent,
+        "task_description": task_description,
+        "context_passed": list(result.get("context_passed") or []),
+        "risk_level": str(result.get("risk_level") or "low"),
+        "memory_action": memory_action,
+        "memory_content": memory_content,
+    }
+
+
+def _collapse_single_subtask_multi_agent(
+    user_input: str,
+    result: IntentResult,
+) -> IntentResult | None:
+    """将“只有 1 个子任务的 multi_agent”收紧为单一 agent 路由。"""
+    if result.get("intent") != "multi_agent":
+        return None
+
+    subtasks = result.get("subtasks")
+    if not isinstance(subtasks, list) or len(subtasks) != 1:
+        return None
+
+    subtask = subtasks[0]
+    if not isinstance(subtask, dict):
+        return None
+
+    agent = str(subtask.get("agent") or "").strip()
+    if agent not in {"shell_agent", "tool_agent", "memory_agent"}:
+        return None
+
+    task_description = str(subtask.get("task_description") or result.get("task_description") or "").strip()
+    context_passed = [
+        str(item).strip()
+        for item in list(subtask.get("context_passed") or result.get("context_passed") or [])
+        if str(item).strip()
+    ]
+    risk_level = str(subtask.get("risk_level") or result.get("risk_level") or "low")
+
+    reasoning = str(result.get("reasoning") or "").strip()
+    if reasoning:
+        reasoning += "；multi_agent 仅生成了 1 个子任务，已自动折叠为单一 Agent 路由。"
+    else:
+        reasoning = "multi_agent 仅生成了 1 个子任务，已自动折叠为单一 Agent 路由。"
+
+    if agent == "shell_agent" and _looks_like_semantic_file_task(user_input, task_description):
+        agent = "tool_agent"
+        reasoning += "；该任务属于“读取后再分析/总结”的语义文件任务，进一步改路由为 tool_agent。"
+
+    temporal_query_info = _detect_temporal_query(user_input, task_description)
+    if agent in {"shell_agent", "tool_agent"} and temporal_query_info is not None:
+        agent = "tool_agent"
+        risk_level = "low"
+        task_description = _build_temporal_tool_task(user_input, task_description)
+        context_passed = [user_input]
+        reasoning += f"；检测到这是“{temporal_query_info['label']}”类时效性问题，改路由为 tool_agent。"
+
+    collapsed: IntentResult = {
+        "reasoning": reasoning,
+        "confidence": float(result.get("confidence") or 0.0),
+        "intent": agent,
+        "risk_level": risk_level,
+        "task_description": task_description,
+        "context_passed": context_passed,
+        "reply": None,
+        "question": None,
+        "options": None,
+        "subtasks": None,
+    }
+
+    if agent == "memory_agent":
+        collapsed["memory_action"] = subtask.get("memory_action")
+        collapsed["memory_content"] = subtask.get("memory_content")
+
+    return collapsed
 
 
 def _detect_temporal_query(*texts: str) -> dict[str, str] | None:
@@ -570,10 +1008,11 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
         "解释",
         "是谁",
     ]
+    memory_request = _detect_memory_request(user_input)
 
     if parsed_raw:
         explicit_intent = parsed_raw.get("intent")
-        if explicit_intent in {"shell_agent", "tool_agent"}:
+        if explicit_intent in {"shell_agent", "tool_agent", "memory_agent"}:
             task_description = parsed_raw.get("task_description") or parsed_raw.get("command")
             context_passed = parsed_raw.get("context_passed")
             if isinstance(task_description, str) and task_description.strip():
@@ -587,7 +1026,44 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
                     "reply": None,
                     "question": None,
                     "options": None,
+                    "subtasks": None,
                 }
+
+        if explicit_intent == "multi_agent":
+            subtasks = parsed_raw.get("subtasks")
+            if isinstance(subtasks, list) and len(subtasks) >= 2:
+                return {
+                    "intent": "multi_agent",
+                    "reasoning": f"结构化解析失败，但模型已给出多子任务规划，降级沿用 multi_agent。原始内容: {raw_text[:200]}",
+                    "confidence": 0.55,
+                    "risk_level": parsed_raw.get("risk_level") or "medium",
+                    "task_description": str(parsed_raw.get("task_description") or "复合请求"),
+                    "context_passed": parsed_raw.get("context_passed") if isinstance(parsed_raw.get("context_passed"), list) else [],
+                    "reply": None,
+                    "question": None,
+                    "options": None,
+                    "subtasks": subtasks,
+                }
+            if isinstance(subtasks, list) and len(subtasks) == 1:
+                collapsed = _collapse_single_subtask_multi_agent(
+                    user_input,
+                    {
+                        "intent": "multi_agent",
+                        "reasoning": f"结构化解析失败，且模型仅返回了 1 个子任务，尝试折叠为单一 Agent 路由。原始内容: {raw_text[:200]}",
+                        "confidence": 0.55,
+                        "risk_level": parsed_raw.get("risk_level") or "low",
+                        "task_description": str(parsed_raw.get("task_description") or "复合请求"),
+                        "context_passed": parsed_raw.get("context_passed")
+                        if isinstance(parsed_raw.get("context_passed"), list)
+                        else [],
+                        "reply": None,
+                        "question": None,
+                        "options": None,
+                        "subtasks": subtasks,
+                    },
+                )
+                if collapsed is not None:
+                    return collapsed
 
         command = parsed_raw.get("command")
         if isinstance(command, str) and command.strip():
@@ -602,6 +1078,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
                 "reply": None,
                 "question": None,
                 "options": None,
+                "subtasks": None,
             }
 
         error_text = parsed_raw.get("error") or parsed_raw.get("reason")
@@ -616,7 +1093,23 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
                 "reply": None,
                 "question": error_text.strip(),
                 "options": ["补充目标路径", "补充更具体操作", "直接用 /命令 执行"],
+                "subtasks": None,
             }
+
+    if memory_request is not None and not _looks_like_compound_request(user_input):
+        memory_subtask = _build_memory_subtask(memory_request)
+        return {
+            "intent": "memory_agent",
+            "reasoning": "结构化解析失败，但检测到显式长期记忆请求，保守降级为 memory_agent。",
+            "confidence": 0.55,
+            "risk_level": "low",
+            "task_description": memory_subtask["task_description"],
+            "context_passed": memory_subtask["context_passed"],
+            "reply": None,
+            "question": None,
+            "options": None,
+            "subtasks": None,
+        }
 
     looks_like_clarification = any(marker in raw_text for marker in clarification_markers)
     looks_like_clarification = looks_like_clarification or any(
@@ -655,6 +1148,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
             "context_passed": [user_input],
             "question": None,
             "options": None,
+            "subtasks": None,
         }
 
     if looks_like_direct_answer and not looks_like_clarification:
@@ -668,6 +1162,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
             "context_passed": None,
             "question": None,
             "options": None,
+            "subtasks": None,
         }
 
     return {
@@ -688,6 +1183,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
             if looks_like_shell_request
             else ["shell_agent", "tool_agent", "direct_answer", "其他"]
         ),
+        "subtasks": None,
     }
 
 
@@ -702,6 +1198,7 @@ def apply_confidence_policy(result: IntentResult) -> IntentResult:
         result.setdefault("question", "你的指令不太明确，能否提供更多细节？")
         if not isinstance(result.get("options"), list):
             result["options"] = []
+        result["subtasks"] = None
 
     return result
 
@@ -711,7 +1208,58 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
     result = dict(result)
     intent = result.get("intent")
     task_description = str(result.get("task_description") or "")
+    subtasks = result.get("subtasks")
+    memory_request = _detect_memory_request(user_input)
+
+    if _looks_like_code_generation_request(user_input, task_description):
+        codegen_result = _build_code_generation_multi_agent(user_input)
+        if memory_request is not None:
+            codegen_result["subtasks"] = list(codegen_result.get("subtasks") or []) + [
+                _build_memory_subtask(memory_request)
+            ]
+        return codegen_result
+
+    collapsed = _collapse_single_subtask_multi_agent(user_input, result)
+    if collapsed is not None:
+        return collapsed
+
     temporal_query_info = _detect_temporal_query(user_input, task_description)
+
+    if memory_request is not None and not subtasks:
+        if intent in {"shell_agent", "tool_agent"} and _looks_like_compound_request(user_input):
+            primary_subtask = _result_to_primary_subtask(result)
+            memory_subtask = _build_memory_subtask(memory_request)
+            if primary_subtask is not None:
+                reasoning = str(result.get("reasoning") or "").strip()
+                result["intent"] = "multi_agent"
+                result["subtasks"] = [primary_subtask, memory_subtask]
+                result["reply"] = None
+                result["question"] = None
+                result["options"] = None
+                if reasoning:
+                    reasoning += "；检测到请求同时包含执行任务与长期记忆操作，已拆分为多子任务。"
+                else:
+                    reasoning = "检测到请求同时包含执行任务与长期记忆操作，已拆分为多子任务。"
+                result["reasoning"] = reasoning
+                return result
+
+        if intent not in {"multi_agent", "shell_agent", "tool_agent"} or not _looks_like_compound_request(user_input):
+            memory_subtask = _build_memory_subtask(memory_request)
+            reasoning = str(result.get("reasoning") or "").strip()
+            result["intent"] = "memory_agent"
+            result["risk_level"] = "low"
+            result["task_description"] = memory_subtask["task_description"]
+            result["context_passed"] = memory_subtask["context_passed"]
+            result["reply"] = None
+            result["question"] = None
+            result["options"] = None
+            result["subtasks"] = None
+            if reasoning:
+                reasoning += "；检测到显式长期记忆指令，改路由为 memory_agent。"
+            else:
+                reasoning = "检测到显式长期记忆指令，改路由为 memory_agent。"
+            result["reasoning"] = reasoning
+            return result
 
     if temporal_query_info is not None:
         reasoning = str(result.get("reasoning") or "").strip()
@@ -722,6 +1270,7 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
         result["reply"] = None
         result["question"] = None
         result["options"] = None
+        result["subtasks"] = None
         if reasoning:
             reasoning += (
                 f"；检测到这是“{temporal_query_info['label']}”类时效性问题，"
@@ -741,6 +1290,29 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
             reasoning = "检测到这是“读取文件后做语义理解/总结”的任务，按规则路由为 tool_agent。"
         result["reasoning"] = reasoning
 
+    if intent == "multi_agent" and isinstance(subtasks, list):
+        normalized_subtasks: list[dict[str, Any]] = []
+        for subtask in subtasks:
+            if not isinstance(subtask, dict):
+                continue
+            agent = subtask.get("agent")
+            subtask_description = str(subtask.get("task_description") or "")
+            subtask_context = list(subtask.get("context_passed") or [])
+            if agent == "shell_agent" and _looks_like_semantic_file_task(user_input, subtask_description):
+                agent = "tool_agent"
+            if agent in {"shell_agent", "tool_agent"} and _detect_temporal_query(user_input, subtask_description):
+                agent = "tool_agent"
+                subtask_description = _build_temporal_tool_task(user_input, subtask_description)
+                subtask_context = [user_input]
+
+            normalized_subtask = dict(subtask)
+            normalized_subtask["agent"] = agent
+            normalized_subtask["task_description"] = subtask_description
+            normalized_subtask["context_passed"] = subtask_context
+            normalized_subtasks.append(normalized_subtask)
+
+        result["subtasks"] = normalized_subtasks or subtasks
+
     return result
 
 
@@ -751,12 +1323,13 @@ def classify_intent(
     model: str | None = None,
     max_retries: int = 1,
     verbose: bool = False,
+    extra_context: dict[str, str] | None = None,
 ) -> IntentResult:
     """调用 LLM 进行意图分类，返回结构化结果 dict。"""
     llm_client = llm_client or client
     model = model or DEFAULT_MODEL
     context = get_advanced_context()
-    system_prompt = get_system_prompt(context)
+    system_prompt = get_system_prompt(context, extra_context=extra_context)
 
     for attempt in range(1 + max_retries):
         try:
@@ -809,6 +1382,7 @@ def handle_intent(
     model: str | None = None,
     max_retries: int = 1,
     verbose: bool = False,
+    extra_context: dict[str, str] | None = None,
 ) -> IntentResult:
     """分类并应用置信度策略，返回最终可路由结果。"""
     result = classify_intent(
@@ -817,6 +1391,7 @@ def handle_intent(
         model=model,
         max_retries=max_retries,
         verbose=verbose,
+        extra_context=extra_context,
     )
     result = apply_intent_overrides(user_input, result)
     return apply_confidence_policy(result)

@@ -42,7 +42,37 @@ except ImportError:
 
 StatusCallback = Callable[[str], None | Awaitable[None]]
 LOCAL_PASS_CONFIDENCE = 0.8
-LOCAL_PASS_INTENTS = {"shell_agent", "direct_answer"}
+LOCAL_PASS_INTENTS = {"shell_agent", "direct_answer", "memory_agent"}
+LOCAL_SUBTASK_SCHEMA = {
+    "type": "object",
+    "required": [
+        "agent",
+        "task_description",
+        "context_passed",
+        "risk_level",
+        "memory_action",
+        "memory_content",
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "agent": {"type": "string", "enum": ["shell_agent", "tool_agent", "memory_agent"]},
+        "task_description": {"type": "string"},
+        "context_passed": {"type": "array", "items": {"type": "string"}},
+        "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+        "memory_action": {
+            "anyOf": [
+                {"type": "string", "enum": ["save", "search", "delete", "list"]},
+                {"type": "null"},
+            ]
+        },
+        "memory_content": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
+    },
+}
 LOCAL_FASTPATH_JSON_SCHEMA_NAME = "local_fastpath_routing_result"
 LOCAL_FASTPATH_JSON_SCHEMA = {
     "type": "object",
@@ -54,6 +84,7 @@ LOCAL_FASTPATH_JSON_SCHEMA = {
         "reply",
         "question",
         "options",
+        "subtasks",
     ],
     "additionalProperties": False,
     "properties": {
@@ -61,7 +92,7 @@ LOCAL_FASTPATH_JSON_SCHEMA = {
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "intent": {
             "type": "string",
-            "enum": ["shell_agent", "tool_agent", "direct_answer", "clarification"],
+            "enum": ["shell_agent", "tool_agent", "memory_agent", "multi_agent", "direct_answer", "clarification"],
         },
         "task_description": {
             "anyOf": [
@@ -84,6 +115,12 @@ LOCAL_FASTPATH_JSON_SCHEMA = {
         "options": {
             "anyOf": [
                 {"type": "array", "items": {"type": "string"}},
+                {"type": "null"},
+            ]
+        },
+        "subtasks": {
+            "anyOf": [
+                {"type": "array", "items": LOCAL_SUBTASK_SCHEMA},
                 {"type": "null"},
             ]
         },
@@ -135,23 +172,61 @@ def get_local_context(*, max_files: int = 10) -> dict[str, str]:
     }
 
 
-def get_local_system_prompt(context: dict[str, str]) -> str:
+def _format_extra_context(extra_context: dict[str, str] | None) -> str:
+    if not extra_context:
+        return ""
+
+    sections: list[str] = []
+    short_term = str(extra_context.get("short_term_memory") or "").strip()
+    long_term = str(extra_context.get("long_term_memory") or "").strip()
+
+    if short_term:
+        sections.append(f"""短期会话上下文（RAM）：
+{short_term}""")
+
+    if long_term:
+        sections.append(f"""长期记忆注入（ROM）：
+{long_term}""")
+
+    last_file_path = str(extra_context.get("last_file_path") or "").strip()
+    last_document_summary = str(extra_context.get("last_document_summary") or "").strip()
+    last_document_content = str(extra_context.get("last_document_content") or "").strip()
+    if last_file_path or last_document_summary or last_document_content:
+        lines = ["最近文档 Artifact（若用户说“前文所述/那个 README/该文档”，优先指向它）："]
+        if last_file_path:
+            lines.append(f"- 路径: {last_file_path}")
+        if last_document_summary:
+            lines.append(f"- 摘要: {last_document_summary}")
+        if last_document_content:
+            lines.append(f"- 内容片段:\n{last_document_content}")
+        sections.append("\n".join(lines))
+
+    return ("\n" + "\n\n".join(sections)) if sections else ""
+
+
+def get_local_system_prompt(context: dict[str, str], extra_context: dict[str, str] | None = None) -> str:
     """给 4B 本地小模型使用的精简版 Prompt。"""
     return f"""你是多 Agent 命令行系统的本地快速路由器，只负责快速判断用户意图。
 
 你必须且只能输出一个 JSON 对象，不要输出 Markdown、解释或代码块。
 必须按字段顺序输出：reasoning -> confidence -> intent -> task_description -> reply -> question -> options
 
-仅支持四种 intent：
+仅支持六种 intent：
 1. shell_agent：明确的本地命令/文件系统任务。
 2. tool_agent：需要复杂推理、读文件理解、外部工具或 MCP。
-3. direct_answer：纯问答或闲聊。
-4. clarification：信息不足，必须追问。
+3. memory_agent：显式的长期记忆读写请求。
+4. multi_agent：一个请求包含多个顺序子任务。
+5. direct_answer：纯问答或闲聊。
+6. clarification：信息不足，必须追问。
 
 决策要求：
 - 如果不确定，降低 confidence。
 - 如果像“查看目录 / 创建文件 / 运行命令”这类明确本地任务，优先判为 shell_agent。
 - tool_agent 只在你明确觉得 4B 本地模型不该继续判断时使用。
+- 如果是“记住 / 你还记得 / 列出记忆 / 忘掉”这类显式记忆请求，判为 memory_agent。
+- 如果请求中同时包含“执行任务 + 记住结果”等两个动作，判为 multi_agent（即使你不给 subtasks，也不要判 direct_answer）。
+- 如果请求属于“实现代码 / 写文件 / 生成网页 / 补 README / 在某目录下完成一个 demo 或小游戏”这类落地开发任务，优先判为 multi_agent，不要判为 shell_agent。
+- 如果判为 multi_agent，subtasks 至少要有 2 项；只有 1 项时应改回对应单一 intent。
 - 如果任务是“读取文件/代码/文档后再总结、分析、解释、翻译”，必须判为 tool_agent。
 - 如果任务依赖“当前时间/日期/星期、天气、新闻、汇率、最新/实时数据”等时效性信息，不能判为 direct_answer，必须交给 tool_agent。
 - shell_agent 只输出简短 task_description，不做深入风险分析。
@@ -162,10 +237,10 @@ def get_local_system_prompt(context: dict[str, str]) -> str:
 - 当前目录: {context['pwd']}
 - 目录概览（最多 10 项，已过滤隐藏文件）:
 {context['files']}
-- Git 状态: {context['git_status']}
+- Git 状态: {context['git_status']}{_format_extra_context(extra_context)}
 
 输出格式：
-如果 intent="shell_agent" 或 "tool_agent"：
+如果 intent="shell_agent"、"tool_agent" 或 "memory_agent"：
 {{
   "reasoning": "简短推理",
   "confidence": 0.90,
@@ -173,7 +248,37 @@ def get_local_system_prompt(context: dict[str, str]) -> str:
   "task_description": "给后续 Agent 的简短任务说明",
   "reply": null,
   "question": null,
-  "options": null
+  "options": null,
+  "subtasks": null
+}}
+
+如果 intent="multi_agent"：
+{{
+  "reasoning": "这是复合请求",
+  "confidence": 0.82,
+  "intent": "multi_agent",
+  "task_description": "整体任务摘要",
+  "reply": null,
+  "question": null,
+  "options": null,
+  "subtasks": [
+    {{
+      "agent": "shell_agent",
+      "task_description": "子任务说明",
+      "context_passed": [],
+      "risk_level": "low",
+      "memory_action": null,
+      "memory_content": null
+    }},
+    {{
+      "agent": "memory_agent",
+      "task_description": "第二个子任务说明",
+      "context_passed": [],
+      "risk_level": "low",
+      "memory_action": "save",
+      "memory_content": "{{last_result}}"
+    }}
+  ]
 }}
 
 如果 intent="direct_answer"：
@@ -184,7 +289,8 @@ def get_local_system_prompt(context: dict[str, str]) -> str:
   "task_description": null,
   "reply": "直接回答用户",
   "question": null,
-  "options": null
+  "options": null,
+  "subtasks": null
 }}
 
 如果 intent="clarification"：
@@ -195,7 +301,8 @@ def get_local_system_prompt(context: dict[str, str]) -> str:
   "task_description": null,
   "reply": null,
   "question": "需要补充什么信息？",
-  "options": ["候选1", "候选2"]
+  "options": ["候选1", "候选2"],
+  "subtasks": null
 }}""".strip()
 
 
@@ -214,12 +321,21 @@ def validate_local_result(data: dict[str, Any]) -> tuple[bool, str]:
         return False, "confidence 超出范围"
 
     intent = data.get("intent")
-    if intent not in {"shell_agent", "tool_agent", "direct_answer", "clarification"}:
+    if intent not in {"shell_agent", "tool_agent", "memory_agent", "multi_agent", "direct_answer", "clarification"}:
         return False, "intent 非法"
 
-    if intent in {"shell_agent", "tool_agent"}:
-        if not isinstance(data.get("task_description"), str) or not data["task_description"].strip():
+    subtasks = data.get("subtasks")
+    if subtasks is not None and not isinstance(subtasks, list):
+        return False, "subtasks 必须为数组或 null"
+
+    if intent in {"shell_agent", "tool_agent", "memory_agent"}:
+        if subtasks is None and (not isinstance(data.get("task_description"), str) or not data["task_description"].strip()):
             return False, f"{intent} 必须提供非空 task_description"
+    elif intent == "multi_agent":
+        if not isinstance(subtasks, list) or not subtasks:
+            return False, "multi_agent 必须提供非空 subtasks"
+        if len(subtasks) < 2:
+            return False, "multi_agent 至少需要 2 个子任务"
     elif intent == "direct_answer":
         if not isinstance(data.get("reply"), str) or not data["reply"].strip():
             return False, "direct_answer 必须提供非空 reply"
@@ -246,13 +362,27 @@ def normalize_local_result(result: dict[str, Any], user_input: str) -> dict[str,
         "reply": None,
         "question": None,
         "options": None,
+        "subtasks": None,
     }
 
-    if intent in {"shell_agent", "tool_agent"}:
+    if intent in {"shell_agent", "tool_agent", "memory_agent"}:
         task_description = str(result.get("task_description", "")).strip()
         normalized["task_description"] = task_description
         normalized["context_passed"] = []
         normalized["risk_level"] = _infer_fallback_risk(f"{user_input}\n{task_description}")
+    elif intent == "multi_agent":
+        subtasks = result.get("subtasks")
+        if isinstance(subtasks, list):
+            normalized["subtasks"] = subtasks
+            subtask_risks = [str(item.get("risk_level") or "low") for item in subtasks if isinstance(item, dict)]
+            if "high" in subtask_risks:
+                normalized["risk_level"] = "high"
+            elif "medium" in subtask_risks:
+                normalized["risk_level"] = "medium"
+            else:
+                normalized["risk_level"] = "low"
+        normalized["task_description"] = str(result.get("task_description", "")).strip() or "复合任务"
+        normalized["context_passed"] = []
     elif intent == "direct_answer":
         normalized["reply"] = str(result.get("reply", "")).strip()
     else:
@@ -273,10 +403,10 @@ async def _emit_status(callback: StatusCallback | None, message: str) -> None:
         await maybe
 
 
-async def _request_local_fastpath_json(user_input: str) -> str:
+async def _request_local_fastpath_json(user_input: str, extra_context: dict[str, str] | None = None) -> str:
     """向本地 Ollama 发起非流式 JSON 模式请求。"""
     context = get_local_context()
-    system_prompt = get_local_system_prompt(context)
+    system_prompt = get_local_system_prompt(context, extra_context=extra_context)
     response = await local_slm_client.chat.completions.create(
         model=LOCAL_SLM_MODEL,
         messages=[
@@ -289,11 +419,11 @@ async def _request_local_fastpath_json(user_input: str) -> str:
     return response.choices[0].message.content or ""
 
 
-async def try_local_fastpath(user_input: str) -> LocalAttempt:
+async def try_local_fastpath(user_input: str, extra_context: dict[str, str] | None = None) -> LocalAttempt:
     """尝试使用本地 SLM 进行快速路由。"""
     started = perf_counter()
     try:
-        raw_text = await _request_local_fastpath_json(user_input)
+        raw_text = await _request_local_fastpath_json(user_input, extra_context=extra_context)
     except (APIConnectionError, APITimeoutError, ConnectionError, OSError):
         latency = (perf_counter() - started) * 1000
         return LocalAttempt(False, None, latency, "local_unavailable")
@@ -354,10 +484,11 @@ class DualEngineRouter:
         user_input: str,
         *,
         status_callback: StatusCallback | None = None,
+        extra_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """先尝试本地 Fast-Path，失败后静默降级到云端。"""
         total_started = perf_counter()
-        local_attempt = await try_local_fastpath(user_input)
+        local_attempt = await try_local_fastpath(user_input, extra_context=extra_context)
 
         if local_attempt.accepted and local_attempt.result is not None:
             result = dict(local_attempt.result)
@@ -385,6 +516,7 @@ class DualEngineRouter:
             self.cloud_model,
             self.max_retries,
             self.verbose,
+            extra_context,
         )
         cloud_latency_ms = (perf_counter() - cloud_started) * 1000
         cloud_result = dict(cloud_result)
@@ -405,6 +537,7 @@ async def route_user_input(
     user_input: str,
     *,
     status_callback: StatusCallback | None = None,
+    extra_context: dict[str, str] | None = None,
     cloud_llm_client: Any | None = None,
     cloud_model: str | None = None,
     max_retries: int = 1,
@@ -417,7 +550,7 @@ async def route_user_input(
         max_retries=max_retries,
         verbose=verbose,
     )
-    return await router.route(user_input, status_callback=status_callback)
+    return await router.route(user_input, status_callback=status_callback, extra_context=extra_context)
 
 
 __all__ = [

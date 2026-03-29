@@ -60,6 +60,7 @@ image-geometry==3.2.1
 interactive-markers==2.3.2
 Jinja2==3.1.6
 jiter==0.13.0
+jieba==0.42.1
 joint-state-publisher==2.4.0
 joint-state-publisher-gui==2.4.0
 laser-geometry==2.4.1

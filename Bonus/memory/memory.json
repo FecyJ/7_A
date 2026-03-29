@@ -1,22 +1,10 @@
 {
   "_meta": {
-    "total": 2,
-    "last_updated": "2026-03-28T17:06:30.357152",
+    "total": 3,
+    "last_updated": "2026-03-29T16:44:01.815664",
     "tip": "这是 Memory Agent 的持久化存储文件，可以手动编辑。每条记忆包含 id、category、content、keywords、timestamp 字段。"
   },
   "memories": [
-    {
-      "id": "9180ea1a",
-      "category": "project",
-      "content": "这个项目改用 Django 框架了",
-      "keywords": [
-        "Django",
-        "改用",
-        "项目",
-        "框架"
-      ],
-      "timestamp": "2026-03-28T17:06:30.356984"
-    },
     {
       "id": "f66c82ab",
       "category": "preference",
@@ -29,6 +17,19 @@
         "代码"
       ],
       "timestamp": "2026-03-28T17:06:30.356678"
+    },
+    {
+      "id": "ebaa570d",
+      "category": "project",
+      "content": "这是一个多Agent CLI 项目",
+      "keywords": [
+        "项目",
+        "Agent",
+        "这是",
+        "一个多",
+        "CLI"
+      ],
+      "timestamp": "2026-03-29T16:44:01.815655"
     }
   ]
 }

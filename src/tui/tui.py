@@ -5,6 +5,7 @@ from .command_input import CommandInput
 from .dialogs import InteractionPanel
 from .footer import AgentFooter
 from .log_view import AgentRichLog, stylize_error_keywords
+from .session_sidebar import SessionSidebar
 
 __all__ = [
     "AgentCLI",
@@ -12,5 +13,6 @@ __all__ = [
     "AgentFooter",
     "CommandInput",
     "InteractionPanel",
+    "SessionSidebar",
     "stylize_error_keywords",
 ]

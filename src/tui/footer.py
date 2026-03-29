@@ -15,8 +15,11 @@ class AgentFooter(Footer):
     """固定关键快捷键在 Footer 中的显示顺序"""
 
     KEY_ORDER = {
-        "ctrl+c": 0,
-        "ctrl+d": 1,
+        "ctrl+n": 0,
+        "ctrl+b": 1,
+        "ctrl+j": 2,
+        "ctrl+c": 3,
+        "ctrl+d": 4,
     }
 
     def _sorted_visible_bindings(self) -> list[tuple[Binding, bool, str]]:

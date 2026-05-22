@@ -10,6 +10,7 @@ from .client import (
 )
 from .router import (
     DualEngineRouter,
+    LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH,
     LOCAL_FASTPATH_JSON_SCHEMA,
     LOCAL_FASTPATH_JSON_SCHEMA_NAME,
     LOCAL_PASS_CONFIDENCE,
@@ -23,6 +24,7 @@ from .router import (
 __all__ = [
     "CLOUD_MODEL",
     "DualEngineRouter",
+    "LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH",
     "LOCAL_FASTPATH_JSON_SCHEMA",
     "LOCAL_FASTPATH_JSON_SCHEMA_NAME",
     "LOCAL_PASS_CONFIDENCE",

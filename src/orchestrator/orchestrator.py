@@ -371,6 +371,29 @@ class OrchestratorAgent:
         return f"{question}\n\n{option_lines}"
 
     @staticmethod
+    def _compose_clarification_followup(
+        original_input: str,
+        *,
+        question: str,
+        answer: str,
+    ) -> str:
+        """将澄清选择补回原始请求，形成下一轮更完整输入。"""
+        base = str(original_input or "").strip()
+        picked = str(answer or "").strip()
+        prompt = str(question or "").strip()
+        if not picked:
+            return base
+        return "\n".join(
+            part
+            for part in [
+                base,
+                f"补充说明：{picked}",
+                f"澄清问题：{prompt}" if prompt else "",
+            ]
+            if part
+        )
+
+    @staticmethod
     def _clip_text(text: str, limit: int = 160) -> str:
         plain = " ".join(str(text or "").split())
         if len(plain) <= limit:
@@ -1153,6 +1176,31 @@ class OrchestratorAgent:
             self._remember_exchange(user_input, reply)
         elif intent == "clarification":
             ui.output_workflow("当前信息不足，需要进一步澄清", state="warn")
+            question = str(result.get("question") or "请补充更多信息。").strip()
+            options = [str(option).strip() for option in list(result.get("options") or []) if str(option).strip()]
+
+            if options:
+                selected = await ui.prompt_clarification(
+                    question=question,
+                    options=options,
+                    allow_manual=True,
+                    manual_prompt="请输入更具体的需求、功能或技术栈...",
+                )
+                if selected:
+                    ui.output_system(f"已选择：{selected}", style="dim")
+                    followup_input = self._compose_clarification_followup(
+                        user_input,
+                        question=question,
+                        answer=selected,
+                    )
+                    return await self.handle_input(followup_input, ui)
+
+                self._remember_exchange(user_input, question)
+                return {
+                    **result,
+                    "status": "clarification_cancelled",
+                }
+
             clarification_text = self._build_clarification_markdown(result)
             await self._stream_response(
                 ui,

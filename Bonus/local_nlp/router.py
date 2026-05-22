@@ -41,8 +41,31 @@ except ImportError:
 
 
 StatusCallback = Callable[[str], None | Awaitable[None]]
-LOCAL_PASS_CONFIDENCE = 0.8
-LOCAL_PASS_INTENTS = {"shell_agent", "direct_answer", "memory_agent"}
+
+
+def _read_env_flag(name: str, default: bool) -> bool:
+    """读取布尔环境变量。"""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_local_pass_confidence() -> float:
+    """读取本地 Fast-Path 采纳阈值，默认更保守。"""
+    raw_value = os.getenv("LOCAL_PASS_CONFIDENCE", "0.88").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 0.88
+    return max(0.0, min(1.0, value))
+
+
+LOCAL_PASS_CONFIDENCE = _resolve_local_pass_confidence()
+LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH = _read_env_flag("LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH", False)
+LOCAL_PASS_INTENTS = {"shell_agent", "memory_agent"} | (
+    {"direct_answer"} if LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH else set()
+)
 LOCAL_SUBTASK_SCHEMA = {
     "type": "object",
     "required": [
@@ -454,6 +477,8 @@ async def try_local_fastpath(user_input: str, extra_context: dict[str, str] | No
 
     if intent == "tool_agent":
         return LocalAttempt(False, normalized, latency, "tool_agent_requires_cloud", raw_text=raw_text)
+    if intent == "direct_answer" and not LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH:
+        return LocalAttempt(False, normalized, latency, "direct_answer_prefers_cloud", raw_text=raw_text)
     if confidence < LOCAL_PASS_CONFIDENCE:
         return LocalAttempt(False, normalized, latency, "low_confidence", raw_text=raw_text)
     if intent not in LOCAL_PASS_INTENTS:
@@ -506,6 +531,8 @@ class DualEngineRouter:
             await _emit_status(status_callback, "本地计算节点未就绪，已切换云端")
         elif local_attempt.reason == "json_decode_error" or local_attempt.reason.startswith("invalid_local_json"):
             await _emit_status(status_callback, "本地 JSON 解析失败，已切换云端")
+        elif local_attempt.reason == "direct_answer_prefers_cloud":
+            await _emit_status(status_callback, "本地 direct_answer 已限制，已切换云端")
 
         cloud_started = perf_counter()
         cloud_result = await asyncio.to_thread(

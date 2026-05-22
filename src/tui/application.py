@@ -20,6 +20,7 @@ from .dialogs import InteractionPanel
 from .footer import AgentFooter
 from .log_view import AgentRichLog
 from .session_sidebar import SessionSidebar
+from .welcome import WelcomeSplash
 
 
 class AgentCLI(App):
@@ -73,7 +74,8 @@ class AgentCLI(App):
         height: 1fr;
     }
 
-    #log_area { height: 1fr; border: solid green; }
+    #welcome_panel { height: 1fr; }
+    #log_area { height: 1fr; border: solid green; display: none; }
     #interaction_panel { height: auto; }
     #command_input { height: 5; }
     """
@@ -118,6 +120,7 @@ class AgentCLI(App):
                 yield Static("会话历史", id="sidebar_header")
                 yield SessionSidebar(id="sidebar")
             with Vertical(id="conversation_panel"):
+                yield WelcomeSplash(id="welcome_panel")
                 yield AgentRichLog(id="log_area")
                 yield InteractionPanel(id="interaction_panel")
                 yield CommandInput(
@@ -170,6 +173,9 @@ class AgentCLI(App):
     def _query_log(self) -> AgentRichLog:
         return self.query_one("#log_area", AgentRichLog)
 
+    def _query_welcome(self) -> WelcomeSplash:
+        return self.query_one("#welcome_panel", WelcomeSplash)
+
     def _query_sidebar(self) -> SessionSidebar:
         return self.query_one("#sidebar", SessionSidebar)
 
@@ -178,6 +184,14 @@ class AgentCLI(App):
 
     def _focus_input(self) -> None:
         self._query_input().focus()
+
+    def _set_welcome_visible(self, visible: bool) -> None:
+        """切换空白会话欢迎页。"""
+        self._query_welcome().display = visible
+        self._query_log().display = not visible
+
+    def _sync_welcome_state(self) -> None:
+        self._set_welcome_visible(not self._session_messages)
 
     def _export_orchestrator_state(self) -> dict[str, Any]:
         if self.orchestrator_agent is None or not hasattr(self.orchestrator_agent, "export_session_state"):
@@ -245,11 +259,13 @@ class AgentCLI(App):
                     )
         finally:
             self._suspend_session_capture = False
+            self._set_welcome_visible(not messages)
 
     def _append_session_entry(self, entry: dict[str, Any]) -> None:
         if self._suspend_session_capture:
             return
         self._session_messages.append(dict(entry))
+        self._sync_welcome_state()
         self.run_worker(
             self._persist_current_session(),
             name="persist-session",
@@ -456,16 +472,19 @@ class AgentCLI(App):
 
     def output_user(self, text: str) -> None:
         """输出用户输入。"""
+        self._set_welcome_visible(False)
         self._query_log().write_user_message(text)
         self._append_session_entry({"kind": "user", "content": text})
 
     def output_system(self, text: str, style: str = "") -> None:
         """流式输出系统日志或 Shell 命令回显。"""
+        self._set_welcome_visible(False)
         self._query_log().write_system_message(text, style=style)
         self._append_session_entry({"kind": "system", "content": text, "style": style})
 
     def output_workflow(self, text: str, state: str = "info") -> None:
         """输出流程状态日志。"""
+        self._set_welcome_visible(False)
         self._query_log().write_workflow_message(text, state=state)
         self._append_session_entry({"kind": "workflow", "content": text, "state": state})
 
@@ -476,6 +495,7 @@ class AgentCLI(App):
         language: str | None = None,
     ) -> None:
         """输出 LLM 的答复。"""
+        self._set_welcome_visible(False)
         self._query_log().write_llm_message(content, markdown=markdown, language=language)
         entry: dict[str, Any] = {"kind": "llm", "content": content}
         if markdown is not None:
@@ -491,6 +511,7 @@ class AgentCLI(App):
         language: str | None = None,
     ) -> None:
         """以逐步刷新的形式输出 LLM 内容。"""
+        self._set_welcome_visible(False)
         entry: dict[str, Any] = {"kind": "llm", "content": content}
         if markdown is not None:
             entry["markdown"] = markdown

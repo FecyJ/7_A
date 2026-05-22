@@ -132,7 +132,7 @@ class InteractionPanel(Vertical, can_focus=True):
         self.display = False
 
     def _apply_dynamic_height(self) -> None:
-        """将交互面板高度控制在屏幕的大约一半，但确保选项能显示出来。"""
+        """将交互面板高度控制在屏幕的一半左右。"""
         screen_height = max(12, getattr(self.screen.size, "height", 24))
         max_height = min(max(10, screen_height - 6), max(14, screen_height // 2 + 4))
         self.styles.height = "auto"
@@ -228,10 +228,6 @@ class InteractionPanel(Vertical, can_focus=True):
             widget.update("")
             widget.display = False
         self.refresh(layout=True)
-
-    def _focus_panel(self) -> None:
-        if self.display:
-            self.focus()
 
     def _reveal_actions(self) -> None:
         if self.display:
@@ -368,3 +364,6 @@ class InteractionPanel(Vertical, can_focus=True):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
         self._finish(value or None)
+
+
+__all__ = ["InteractionPanel"]

@@ -238,6 +238,7 @@ def get_system_prompt(context: dict[str, str], extra_context: dict[str, str] | N
    - 示例："用我最喜欢的语言写一个 Hello World，并记住这个文件路径。"
 6. "clarification": (最高优先级) 指令模糊或存在安全隐患，必须追问。
    - 边界：存在你认为无从确定的模糊指代；或者用户要求操作的实体在【当前环境上下文】中不存在并且你无法推断其含义；或者操作极度危险但意图不明。
+   - 强规则：如果用户只说“实现一个程序 / 写个项目 / 做个网页”这类产出型需求，但没有说明具体功能、输入输出、语言或框架，应判为 clarification，并尽量给出候选方向。
 
 【子任务拆分规则】
 - 如果一个请求只需一个下级 Agent，就使用对应单一 intent。
@@ -597,6 +598,97 @@ def _looks_like_compound_request(user_input: str) -> bool:
     return any(connector in lowered for connector in connectors)
 
 
+def _extract_requested_workspace_path(user_input: str) -> str | None:
+    """尽量从用户输入中提取目标目录/路径片段。"""
+    text = user_input.strip()
+    patterns = [
+        r"在\s*([A-Za-z0-9_./-]+/)\s*(?:中|里|内)",
+        r"到\s*([A-Za-z0-9_./-]+/)\s*(?:中|里|内)",
+        r"往\s*([A-Za-z0-9_./-]+/)\s*(?:中|里|内)",
+        r"([A-Za-z0-9_./-]+/)\s*(?:目录|文件夹)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _detect_under_specified_build_request(user_input: str) -> dict[str, Any] | None:
+    """识别“实现一个程序”这类信息不足的产出型请求。"""
+    text = " ".join(user_input.strip().split())
+    if not text:
+        return None
+
+    generic_patterns = [
+        r"(?:实现|写|编写|做|开发|创建|新建).{0,10}(?:一个|个)?程序(?:$|[，。,.！？?\s])",
+        r"(?:实现|写|编写|做|开发|创建|新建).{0,10}(?:一个|个)?项目(?:$|[，。,.！？?\s])",
+        r"(?:实现|写|编写|做|开发|创建|新建).{0,10}(?:一个|个)?网页(?:$|[，。,.！？?\s])",
+        r"(?:实现|写|编写|做|开发|创建|新建).{0,10}(?:一个|个)?应用(?:$|[，。,.！？?\s])",
+        r"(?:实现|写|编写|做|开发|创建|新建).{0,10}(?:一个|个)?脚本(?:$|[，。,.！？?\s])",
+        r"(?:帮我)?在\s*[A-Za-z0-9_./-]+/\s*(?:中|里|内)?\s*(?:实现|写|编写|做|开发|创建|新建).{0,10}(?:一个|个)?程序(?:$|[，。,.！？?\s])",
+    ]
+    if not any(re.search(pattern, text, re.IGNORECASE) for pattern in generic_patterns):
+        return None
+
+    # 若已经给出较具体的软件类型/功能，则不强行澄清。
+    specific_markers = [
+        "2048",
+        "贪吃蛇",
+        "计算器",
+        "聊天室",
+        "爬虫",
+        "管理系统",
+        "博客",
+        "待办",
+        "todo",
+        "flask",
+        "fastapi",
+        "django",
+        "react",
+        "vue",
+        "html",
+        "python",
+        "javascript",
+        "java",
+        "c++",
+        "功能",
+        "输入",
+        "输出",
+        "接口",
+        "api",
+        "页面",
+        "表单",
+        "登录",
+        "上传",
+        "下载",
+        "游戏规则",
+        "命令行",
+        "cli",
+        "gui",
+    ]
+    if any(marker.lower() in text.lower() for marker in specific_markers):
+        return None
+
+    target_path = _extract_requested_workspace_path(text)
+    question = (
+        f"请确认你希望在 {target_path} 中实现哪类程序？"
+        if target_path
+        else "请确认你希望实现哪类程序？"
+    )
+    question += " 目前信息还不足以直接开始写代码。"
+
+    return {
+        "question": question,
+        "options": [
+            "Python 命令行小工具",
+            "HTML/CSS/JS 单页小程序",
+            "Flask / FastAPI Web 程序",
+            "算法 / 练习脚本",
+        ],
+    }
+
+
 def _uses_generic_memory_reference(content: str) -> bool:
     lowered = content.strip().lower()
     generic_markers = [
@@ -903,6 +995,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
         "是谁",
     ]
     memory_request = _detect_memory_request(user_input)
+    vague_build_request = _detect_under_specified_build_request(user_input)
 
     if parsed_raw:
         explicit_intent = parsed_raw.get("intent")
@@ -1002,6 +1095,20 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
             "reply": None,
             "question": None,
             "options": None,
+            "subtasks": None,
+        }
+
+    if vague_build_request is not None:
+        return {
+            "intent": "clarification",
+            "reasoning": "结构化解析失败，且检测到请求仅表达了“实现程序”这一泛化目标，缺少足够规格信息，保守降级为 clarification。",
+            "confidence": 0.0,
+            "risk_level": "low",
+            "task_description": None,
+            "context_passed": None,
+            "reply": None,
+            "question": vague_build_request["question"],
+            "options": list(vague_build_request["options"]),
             "subtasks": None,
         }
 
@@ -1107,6 +1214,24 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
     collapsed = _collapse_single_subtask_multi_agent(user_input, result)
     if collapsed is not None:
         return collapsed
+
+    vague_build_request = _detect_under_specified_build_request(user_input)
+    if vague_build_request is not None:
+        reasoning = str(result.get("reasoning") or "").strip()
+        result["intent"] = "clarification"
+        result["risk_level"] = "low"
+        result["task_description"] = None
+        result["context_passed"] = None
+        result["reply"] = None
+        result["question"] = vague_build_request["question"]
+        result["options"] = list(vague_build_request["options"])
+        result["subtasks"] = None
+        if reasoning:
+            reasoning += "；检测到这是信息不足的泛化产出型请求，已改为 clarification 并补充候选方向。"
+        else:
+            reasoning = "检测到这是信息不足的泛化产出型请求，已改为 clarification 并补充候选方向。"
+        result["reasoning"] = reasoning
+        return result
 
     temporal_query_info = _detect_temporal_query(user_input, task_description)
     memory_request = _detect_memory_request(user_input)

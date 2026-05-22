@@ -1,0 +1,46 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor settings
+.vscode/
+
+# Python caches and tooling output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Agent runtime state
+Bonus/memory/memory.json
+Bonus/memory_conv/sessions.json
+
+# Generated reports and local documentation drafts
+docs/*
+!docs/
+!docs/PTY.md
+!docs/TUI_BACKEND_API.md
+
+# Logs and temporary output
+*.log
+logs/
+tmp/
+*.tmp
+
+# Frontend / build dependencies
+node_modules/
+dist/
+build/
+
+# Local helper scripts and scratch files
+setup-codex.sh
+test/

@@ -153,7 +153,7 @@ def check_tool_permission(tool_name: str, **kwargs: Any) -> ToolPermissionDecisi
                 "high",
                 "read_file 仅允许读取当前工作目录内的相对路径文件，禁止绝对路径、~ 或 ..。",
             )
-        return ToolPermissionDecision("ask", "medium", f"准备读取文件：{file_path}")
+        return ToolPermissionDecision("allow", "low", f"准备读取文件：{file_path}")
 
     if tool_name == "search_files":
         path = str(kwargs.get("path", ".")).strip() or "."

@@ -81,7 +81,7 @@ class ToolObservation:
 class ToolAgent:
     """负责执行 tool_agent 路由下发的复杂工具任务。"""
 
-    MAX_TOOL_ROUNDS = 4
+    MAX_TOOL_ROUNDS = 16  # 单次任务中最多调用工具的轮数，避免死循环
     MAX_CLARIFICATION_ROUNDS = 2
     DEFAULT_TIMEZONE = "Asia/Shanghai"
     CURRENCY_ALIASES = {

@@ -176,7 +176,7 @@ class InteractionPanel(Vertical, can_focus=True):
         widget = self.query_one("#panel_body", Static)
         body = (body or "").strip()
         if body:
-            widget.update(body)
+            widget.update(Text(body))
             widget.display = True
         else:
             widget.update("")
@@ -187,14 +187,14 @@ class InteractionPanel(Vertical, can_focus=True):
         self.display = True
         self._apply_dynamic_height()
         self._set_variant(variant)
-        self.query_one("#panel_title", Static).update(title)
+        self.query_one("#panel_title", Static).update(Text(title))
         self._show_body(body)
         self.refresh(layout=True)
 
     def _show_command_block(self, command: str | None) -> None:
         widget = self.query_one("#panel_command", Static)
         if command:
-            widget.update(f"拟执行命令：\n{command}")
+            widget.update(Text(f"拟执行命令：\n{command}"))
             widget.display = True
         else:
             widget.update("")
@@ -222,7 +222,7 @@ class InteractionPanel(Vertical, can_focus=True):
     def _show_hint(self, hint: str | None) -> None:
         widget = self.query_one("#panel_hint", Static)
         if hint:
-            widget.update(hint)
+            widget.update(Text(hint))
             widget.display = True
         else:
             widget.update("")

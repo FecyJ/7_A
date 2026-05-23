@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import fnmatch
 import json
 import logging
 import os
@@ -19,14 +20,17 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 try:
-    from .security import resolve_workspace_path
+    from .security import MAX_TEXT_WRITE_CHARS, is_protected_workspace_path, resolve_workspace_path
 except ImportError:
-    from security import resolve_workspace_path  # type: ignore
+    from security import MAX_TEXT_WRITE_CHARS, is_protected_workspace_path, resolve_workspace_path  # type: ignore
 
 mcp = FastMCP("tool-agent-server")
 logging.getLogger("mcp").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
+
+MAX_TEXT_READ_CHARS = 200_000
+MAX_SEARCH_FILE_BYTES = 1_000_000
 
 
 def _is_private_or_local_host(hostname: str | None) -> bool:
@@ -113,6 +117,69 @@ def _preview_response_body(response: httpx.Response, max_chars: int) -> str:
     return preview
 
 
+def _workspace_relative(path: Path) -> str:
+    workspace = Path.cwd().resolve()
+    try:
+        return str(path.resolve().relative_to(workspace))
+    except ValueError:
+        return str(path)
+
+
+def _is_hidden_or_git_path(path: Path) -> bool:
+    return any(part == ".git" or part.startswith(".") for part in path.parts)
+
+
+def _path_entry_payload(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+        size = stat.st_size
+        mtime = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+    except OSError:
+        size = None
+        mtime = None
+
+    if path.is_dir():
+        path_type = "directory"
+    elif path.is_file():
+        path_type = "file"
+    elif path.is_symlink():
+        path_type = "symlink"
+    else:
+        path_type = "other"
+
+    return {
+        "name": path.name,
+        "path": _workspace_relative(path),
+        "type": path_type,
+        "size_bytes": size,
+        "modified_at": mtime,
+    }
+
+
+def _iter_workspace_entries(
+    root: Path,
+    *,
+    recursive: bool,
+    max_depth: int,
+    include_hidden: bool,
+):
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            children = sorted(current.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+        except OSError:
+            continue
+
+        for child in children:
+            rel_parts = child.relative_to(root).parts
+            if not include_hidden and _is_hidden_or_git_path(Path(*rel_parts)):
+                continue
+            yield child
+            if recursive and child.is_dir() and depth < max_depth:
+                stack.append((child, depth + 1))
+
+
 def _request_json(
     url: str,
     *,
@@ -153,10 +220,63 @@ def multiply(a: int, b: int) -> int:
     return a * b
 
 
-@mcp.tool(description="列出当前工作目录下的文件和文件夹名称。")
-def list_dir() -> str:
-    entries = sorted(item.name + ("/" if item.is_dir() else "") for item in Path.cwd().iterdir())
-    return json.dumps(entries, ensure_ascii=False)
+@mcp.tool(
+    description=(
+        "列出当前工作目录内指定目录的文件和文件夹。"
+        "path 必须是相对路径；recursive=true 时递归列出，max_depth 控制深度。"
+    )
+)
+def list_dir(path: str = ".", recursive: bool = False, max_depth: int = 2, max_entries: int = 100, include_hidden: bool = False) -> str:
+    target = resolve_workspace_path(path)
+    if target is None:
+        return json.dumps({"ok": False, "error": "非法路径，仅允许当前工作目录内的相对路径。", "path": path}, ensure_ascii=False)
+    if not target.exists():
+        return json.dumps({"ok": False, "error": f"目录不存在：{path}", "path": path}, ensure_ascii=False)
+    if not target.is_dir():
+        return json.dumps({"ok": False, "error": f"目标不是目录：{path}", "path": path}, ensure_ascii=False)
+
+    max_depth = max(0, min(int(max_depth or 0), 8))
+    max_entries = max(1, min(int(max_entries or 100), 1000))
+    entries = []
+    truncated = False
+    for item in _iter_workspace_entries(target, recursive=bool(recursive), max_depth=max_depth, include_hidden=bool(include_hidden)):
+        if len(entries) >= max_entries:
+            truncated = True
+            break
+        entries.append(_path_entry_payload(item))
+
+    return json.dumps(
+        {
+            "ok": True,
+            "path": _workspace_relative(target),
+            "recursive": bool(recursive),
+            "max_depth": max_depth,
+            "entries": entries,
+            "truncated": truncated,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool(description="查看当前工作目录内路径的元信息，包括是否存在、类型、大小和修改时间。path 必须是相对路径。")
+def stat_path(path: str) -> str:
+    target = resolve_workspace_path(path)
+    if target is None:
+        return json.dumps({"ok": False, "exists": False, "error": "非法路径，仅允许当前工作目录内的相对路径。", "path": path}, ensure_ascii=False)
+    if not target.exists():
+        return json.dumps({"ok": True, "exists": False, "path": path}, ensure_ascii=False, indent=2)
+
+    payload = _path_entry_payload(target)
+    payload.update(
+        {
+            "ok": True,
+            "exists": True,
+            "is_readable": os.access(target, os.R_OK),
+            "is_writable": os.access(target, os.W_OK),
+        }
+    )
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(description="获取当前系统的基本信息，包括操作系统、工作目录和 CPU 数。")
@@ -390,9 +510,12 @@ def count_lines(text: str) -> int:
 
 @mcp.tool(
     name="read_file",
-    description="读取当前工作目录内的 UTF-8 文本文件。仅允许相对路径，不允许 .. 或绝对路径。",
+    description=(
+        "读取当前工作目录内的 UTF-8 文本文件。仅允许相对路径。"
+        "可用 start_line/end_line 读取 1-based 行区间，max_chars 控制最大返回字符数。"
+    ),
 )
-def read_file_tool(file_path: str) -> str:
+def read_file_tool(file_path: str, start_line: int | None = None, end_line: int | None = None, max_chars: int = MAX_TEXT_READ_CHARS) -> str:
     target = resolve_workspace_path(file_path)
     if target is None:
         return "读取失败：非法路径，仅允许当前工作目录内的相对路径。"
@@ -400,11 +523,355 @@ def read_file_tool(file_path: str) -> str:
         return f"读取失败：文件不存在 -> {file_path}"
 
     try:
-        return target.read_text(encoding="utf-8")
+        content = target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return f"读取失败：{file_path} 不是 UTF-8 文本文件。"
     except OSError as exc:
         return f"读取失败：{exc}"
+
+    if start_line is not None or end_line is not None:
+        lines = content.splitlines(keepends=True)
+        start = max(1, int(start_line or 1))
+        end = int(end_line or len(lines))
+        if end < start:
+            return "读取失败：end_line 不能小于 start_line。"
+        content = "".join(lines[start - 1 : end])
+
+    max_chars = max(1_000, min(int(max_chars or MAX_TEXT_READ_CHARS), MAX_TEXT_READ_CHARS))
+    if len(content) > max_chars:
+        return content[:max_chars].rstrip() + f"\n...[truncated: read_file max_chars={max_chars}]"
+    return content
+
+
+@mcp.tool(
+    name="search_files",
+    description=(
+        "在当前工作目录内搜索文件名和 UTF-8 文本内容。"
+        "path 必须是相对路径；glob_pattern 可限制文件范围，如 *.py 或 src/**/*.py。"
+    ),
+)
+def search_files(
+    query: str,
+    path: str = ".",
+    glob_pattern: str | None = None,
+    max_results: int = 50,
+    include_hidden: bool = False,
+    search_content: bool = True,
+    search_names: bool = True,
+) -> str:
+    query = str(query or "")
+    if not query:
+        return json.dumps({"ok": False, "error": "query 不能为空。"}, ensure_ascii=False)
+
+    root = resolve_workspace_path(path)
+    if root is None:
+        return json.dumps({"ok": False, "error": "非法路径，仅允许当前工作目录内的相对路径。", "path": path}, ensure_ascii=False)
+    if not root.exists():
+        return json.dumps({"ok": False, "error": f"路径不存在：{path}", "path": path}, ensure_ascii=False)
+
+    max_results = max(1, min(int(max_results or 50), 200))
+    query_lower = query.lower()
+    matches: list[dict[str, Any]] = []
+    truncated = False
+    files_scanned = 0
+
+    candidates = [root] if root.is_file() else _iter_workspace_entries(root, recursive=True, max_depth=20, include_hidden=include_hidden)
+    for candidate in candidates:
+        if len(matches) >= max_results:
+            truncated = True
+            break
+        if not candidate.is_file():
+            continue
+
+        rel_path = _workspace_relative(candidate)
+        if glob_pattern and not fnmatch.fnmatch(rel_path, glob_pattern):
+            continue
+        if not include_hidden and _is_hidden_or_git_path(Path(rel_path)):
+            continue
+
+        files_scanned += 1
+        if search_names and query_lower in rel_path.lower():
+            matches.append({"path": rel_path, "match_type": "name", "line_number": None, "line": None})
+            if len(matches) >= max_results:
+                truncated = True
+                break
+
+        if not search_content:
+            continue
+
+        try:
+            if candidate.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                continue
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+
+        for line_number, line in enumerate(lines, start=1):
+            if query_lower not in line.lower():
+                continue
+            matches.append(
+                {
+                    "path": rel_path,
+                    "match_type": "content",
+                    "line_number": line_number,
+                    "line": line[:300],
+                }
+            )
+            if len(matches) >= max_results:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    return json.dumps(
+        {
+            "ok": True,
+            "query": query,
+            "path": _workspace_relative(root),
+            "glob_pattern": glob_pattern,
+            "files_scanned": files_scanned,
+            "matches": matches,
+            "truncated": truncated,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _validate_text_write_path(path: str, *, expect_directory: bool = False) -> tuple[Path | None, str | None]:
+    target = resolve_workspace_path(path)
+    if target is None:
+        return None, "非法路径，仅允许当前工作目录内的相对路径，禁止绝对路径、~ 或 ..。"
+    if is_protected_workspace_path(path):
+        return None, "禁止写入 .git 内部路径。"
+    if expect_directory and target.exists() and not target.is_dir():
+        return None, f"目标已存在且不是目录：{path}"
+    if not expect_directory and target.exists() and target.is_dir():
+        return None, f"目标已存在且是目录：{path}"
+    return target, None
+
+
+def _text_write_result(
+    *,
+    ok: bool,
+    action: str,
+    path: str,
+    error: str | None = None,
+    char_count: int | None = None,
+    byte_count: int | None = None,
+    created_dirs: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "ok": ok,
+            "action": action,
+            "path": path,
+            "char_count": char_count,
+            "byte_count": byte_count,
+            "created_dirs": created_dirs,
+            "error": error,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool(
+    name="create_directory",
+    description="在当前工作目录内创建目录。仅允许相对路径，不允许 ..、~、绝对路径或 .git 内部路径。",
+)
+def create_directory_tool(dir_path: str, parents: bool = True, exist_ok: bool = True) -> str:
+    target, error = _validate_text_write_path(dir_path, expect_directory=True)
+    if target is None:
+        return _text_write_result(ok=False, action="create_directory", path=dir_path, error=error)
+
+    try:
+        target.mkdir(parents=bool(parents), exist_ok=bool(exist_ok))
+    except OSError as exc:
+        return _text_write_result(ok=False, action="create_directory", path=dir_path, error=str(exc))
+
+    return _text_write_result(ok=True, action="create_directory", path=dir_path)
+
+
+@mcp.tool(
+    name="write_file",
+    description=(
+        "向当前工作目录内的 UTF-8 文本文件写入内容。"
+        "仅允许相对路径；overwrite=false 时不覆盖已有文件；create_dirs=true 时自动创建父目录。"
+    ),
+)
+def write_file_tool(file_path: str, content: str, overwrite: bool = False, create_dirs: bool = False) -> str:
+    content = str(content)
+    if len(content) > MAX_TEXT_WRITE_CHARS:
+        return _text_write_result(
+            ok=False,
+            action="write_file",
+            path=file_path,
+            error=f"单次写入内容超过 {MAX_TEXT_WRITE_CHARS} 字符上限。",
+        )
+
+    target, error = _validate_text_write_path(file_path)
+    if target is None:
+        return _text_write_result(ok=False, action="write_file", path=file_path, error=error)
+    if target.exists() and not overwrite:
+        return _text_write_result(
+            ok=False,
+            action="write_file",
+            path=file_path,
+            error="文件已存在；如需覆盖请设置 overwrite=true。",
+        )
+    created_dirs = False
+    if not target.parent.exists():
+        if not create_dirs:
+            return _text_write_result(
+                ok=False,
+                action="write_file",
+                path=file_path,
+                error="父目录不存在；如需自动创建请设置 create_dirs=true。",
+            )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            created_dirs = True
+        except OSError as exc:
+            return _text_write_result(ok=False, action="write_file", path=file_path, error=f"创建父目录失败：{exc}")
+
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return _text_write_result(ok=False, action="write_file", path=file_path, error=str(exc))
+
+    return _text_write_result(
+        ok=True,
+        action="write_file",
+        path=file_path,
+        char_count=len(content),
+        byte_count=len(content.encode("utf-8")),
+        created_dirs=created_dirs,
+    )
+
+
+@mcp.tool(
+    name="append_file",
+    description=(
+        "向当前工作目录内的 UTF-8 文本文件追加内容。"
+        "仅允许相对路径；create_dirs=true 时自动创建父目录。"
+    ),
+)
+def append_file_tool(file_path: str, content: str, create_dirs: bool = False) -> str:
+    content = str(content)
+    if len(content) > MAX_TEXT_WRITE_CHARS:
+        return _text_write_result(
+            ok=False,
+            action="append_file",
+            path=file_path,
+            error=f"单次写入内容超过 {MAX_TEXT_WRITE_CHARS} 字符上限。",
+        )
+
+    target, error = _validate_text_write_path(file_path)
+    if target is None:
+        return _text_write_result(ok=False, action="append_file", path=file_path, error=error)
+    created_dirs = False
+    if not target.parent.exists():
+        if not create_dirs:
+            return _text_write_result(
+                ok=False,
+                action="append_file",
+                path=file_path,
+                error="父目录不存在；如需自动创建请设置 create_dirs=true。",
+            )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            created_dirs = True
+        except OSError as exc:
+            return _text_write_result(ok=False, action="append_file", path=file_path, error=f"创建父目录失败：{exc}")
+
+    try:
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+    except OSError as exc:
+        return _text_write_result(ok=False, action="append_file", path=file_path, error=str(exc))
+
+    return _text_write_result(
+        ok=True,
+        action="append_file",
+        path=file_path,
+        char_count=len(content),
+        byte_count=len(content.encode("utf-8")),
+        created_dirs=created_dirs,
+    )
+
+
+@mcp.tool(
+    name="replace_in_file",
+    description=(
+        "在当前工作目录内的 UTF-8 文本文件中做精确字符串替换。"
+        "默认要求 old_text 恰好出现 1 次；expected_replacements 可指定期望替换次数。"
+    ),
+)
+def replace_in_file_tool(
+    file_path: str,
+    old_text: str,
+    new_text: str,
+    expected_replacements: int = 1,
+) -> str:
+    old_text = str(old_text)
+    new_text = str(new_text)
+    expected_replacements = int(expected_replacements or 1)
+    if not old_text:
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error="old_text 不能为空。")
+    if expected_replacements < 1:
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error="expected_replacements 必须大于 0。")
+    if len(new_text) > MAX_TEXT_WRITE_CHARS:
+        return _text_write_result(
+            ok=False,
+            action="replace_in_file",
+            path=file_path,
+            error=f"new_text 超过 {MAX_TEXT_WRITE_CHARS} 字符上限。",
+        )
+
+    target, error = _validate_text_write_path(file_path)
+    if target is None:
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error=error)
+    if not target.exists() or not target.is_file():
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error=f"文件不存在：{file_path}")
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error="目标不是 UTF-8 文本文件。")
+    except OSError as exc:
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error=str(exc))
+
+    actual_replacements = content.count(old_text)
+    if actual_replacements != expected_replacements:
+        return _text_write_result(
+            ok=False,
+            action="replace_in_file",
+            path=file_path,
+            error=f"old_text 出现 {actual_replacements} 次，不等于 expected_replacements={expected_replacements}，已取消写入。",
+        )
+
+    updated = content.replace(old_text, new_text, expected_replacements)
+    if len(updated) > MAX_TEXT_WRITE_CHARS:
+        return _text_write_result(
+            ok=False,
+            action="replace_in_file",
+            path=file_path,
+            error=f"替换后的文件内容超过 {MAX_TEXT_WRITE_CHARS} 字符上限。",
+        )
+
+    try:
+        target.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        return _text_write_result(ok=False, action="replace_in_file", path=file_path, error=str(exc))
+
+    return _text_write_result(
+        ok=True,
+        action="replace_in_file",
+        path=file_path,
+        char_count=len(updated),
+        byte_count=len(updated.encode("utf-8")),
+    )
 
 
 @mcp.tool(

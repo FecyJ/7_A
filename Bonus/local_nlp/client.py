@@ -11,6 +11,20 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
+
+def _apply_openai_env_aliases() -> None:
+    """Support local .env files that use generic LLM_* names."""
+    aliases = {
+        "OPENAI_API_KEY": "LLM_API_KEY",
+        "OPENAI_BASE_URL": "LLM_BASE_URL",
+    }
+    for target, source in aliases.items():
+        if not os.getenv(target) and os.getenv(source):
+            os.environ[target] = os.getenv(source, "")
+
+
+_apply_openai_env_aliases()
+
 LOCAL_SLM_BASE_URL = os.getenv("LOCAL_SLM_BASE_URL", "http://localhost:11434/v1")
 LOCAL_SLM_MODEL = os.getenv("LOCAL_SLM_MODEL", "qwen3.5:4b")
 LOCAL_SLM_API_KEY = os.getenv("LOCAL_SLM_API_KEY", "ollama")

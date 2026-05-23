@@ -13,6 +13,20 @@ from openai import OpenAI
 
 load_dotenv()
 
+
+def _apply_openai_env_aliases() -> None:
+    """Support local .env files that use generic LLM_* names."""
+    aliases = {
+        "OPENAI_API_KEY": "LLM_API_KEY",
+        "OPENAI_BASE_URL": "LLM_BASE_URL",
+    }
+    for target, source in aliases.items():
+        if not os.getenv(target) and os.getenv(source):
+            os.environ[target] = os.getenv(source, "")
+
+
+_apply_openai_env_aliases()
+
 ApiMode = Literal["responses", "chat"]
 API_MODE_ENV = "OPENAI_API_MODE"
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
@@ -149,6 +163,21 @@ def _build_responses_json_schema_text_format(
     }
 
 
+def _is_response_format_unavailable(exc: Exception) -> bool:
+    """Detect OpenAI-compatible gateways that reject structured output params."""
+    message = str(exc).lower()
+    return (
+        ("response_format" in message or "json_schema" in message or "json_object" in message or "text.format" in message)
+        and (
+            "unavailable" in message
+            or "unsupported" in message
+            or "not support" in message
+            or "not supported" in message
+            or "invalid_request_error" in message
+        )
+    )
+
+
 def generate_text_response(
     system_prompt: str,
     user_input: str,
@@ -195,10 +224,8 @@ def generate_text_response(
                         full_response += event.delta
 
                 stream.get_final_response()
-        except Exception:
-            if use_structured_output:
-                raise
-            if json_mode and "text" in request_kwargs:
+        except Exception as exc:
+            if (use_structured_output or json_mode) and "text" in request_kwargs and _is_response_format_unavailable(exc):
                 request_kwargs.pop("text", None)
                 full_response = ""
                 with llm_client.responses.stream(**request_kwargs) as stream:
@@ -228,7 +255,14 @@ def generate_text_response(
     elif json_mode and _supports_json_mode(model):
         request_kwargs["response_format"] = {"type": "json_object"}
 
-    response = llm_client.chat.completions.create(**request_kwargs)
+    try:
+        response = llm_client.chat.completions.create(**request_kwargs)
+    except Exception as exc:
+        if "response_format" in request_kwargs and _is_response_format_unavailable(exc):
+            request_kwargs.pop("response_format", None)
+            response = llm_client.chat.completions.create(**request_kwargs)
+        else:
+            raise
     return response.choices[0].message.content or ""
 
 

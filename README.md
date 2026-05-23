@@ -31,6 +31,18 @@ OPENAI_MODEL=gpt-5
 
 `OPENAI_MODEL` 可按你的网关实际支持情况调整。
 
+如需跳过本地 Ollama Fast-Path、固定使用云端意图路由，可在 `.env` 中添加：
+
+```env
+LOCAL_FASTPATH_ENABLED=false
+```
+
+也可以使用等价开关：
+
+```env
+FORCE_CLOUD_ROUTING=true
+```
+
 ## 运行方式
 
 ### 方式 1：使用启动脚本
@@ -59,4 +71,3 @@ python -m src.main
 ```bash
 bash start_agent.sh --check
 ```
-

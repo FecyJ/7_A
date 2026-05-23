@@ -141,7 +141,9 @@ class ToolAgent:
 重要规则：
 - 不要臆造文件路径、工具名或参数。
 - arguments 的键名必须与 input_schema 中的字段名完全一致；例如 read_file 必须使用 file_path。
-- read_file 仅允许当前工作目录内的相对路径；如果文件不明确，应先 ask_clarification。
+- list_dir / stat_path / search_files / read_file / write_file / append_file / replace_in_file / create_directory 仅允许当前工作目录内的相对路径；如果路径不明确，应先 ask_clarification。
+- 探索项目优先使用 list_dir、stat_path、search_files；读取大文件时使用 read_file 的 start_line/end_line/max_chars。
+- 修改已有文本文件优先使用 replace_in_file 做精确替换；写入新文件使用 write_file 且 overwrite=false，必要时设置 create_dirs=true；追加内容使用 append_file。
 - 对“时间/日期/星期、天气、新闻、汇率、最新/实时数据”等时效性问题，禁止凭模型记忆直接回答。
 - 时间/日期优先使用 get_live_time / get_current_time；天气优先使用 get_weather；新闻优先使用 get_news；汇率优先使用 get_exchange_rate。
 - 如果使用 http_request，必须提供明确的 http/https URL；禁止尝试 localhost、内网地址或虚构私有接口。
@@ -203,9 +205,10 @@ class ToolAgent:
     @staticmethod
     def _list_cwd_entries() -> list[str]:
         try:
-            return sorted(item.name + ("/" if item.is_dir() else "") for item in Path.cwd().iterdir())
+            entries = sorted(Path.cwd().iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
         except OSError:
             return []
+        return [item.name + ("/" if item.is_dir() else "") for item in entries if not item.name.startswith(".")]
 
     @staticmethod
     def _looks_like_semantic_file_task(*texts: str) -> bool:
@@ -654,7 +657,7 @@ class ToolAgent:
     async def _prompt_for_clarification(self, plan: ToolPlan, ui: "OrchestratorOutput") -> str | None:
         question = plan.get("question") or "请补充更多信息。"
         llm_options = plan.get("options") if isinstance(plan.get("options"), list) else None
-        cwd_options = [entry for entry in self._list_cwd_entries() if not entry.endswith("/")][:6]
+        cwd_options = self._list_cwd_entries()[:12]
         options = self._merge_options(llm_options, cwd_options)
         return await ui.prompt_clarification(
             question=question,
@@ -732,8 +735,25 @@ class ToolAgent:
             "path": "file_path",
             "file": "file_path",
             "filename": "file_path",
+            "filepath": "file_path",
+            "root": "path",
+            "glob": "glob_pattern",
+            "pattern": "glob_pattern",
+            "dir": "dir_path",
+            "directory": "dir_path",
+            "folder": "dir_path",
+            "text": "content",
+            "data": "content",
             "content": "text",
             "message": "text",
+            "old": "old_text",
+            "before": "old_text",
+            "new": "new_text",
+            "after": "new_text",
+            "replacement": "new_text",
+            "expected": "expected_replacements",
+            "start": "start_line",
+            "end": "end_line",
         }
         remapped: dict[str, Any] = {}
         changed = False

@@ -283,10 +283,12 @@ class ShellAgent:
         try:
             with os.scandir(os.getcwd()) as iterator:
                 for entry in iterator:
+                    if entry.name.startswith("."):
+                        continue
                     entries.append((entry.name, entry.is_dir()))
         except OSError:
             return []
-        return sorted(entries, key=lambda item: (item[1], item[0].lower()))
+        return sorted(entries, key=lambda item: (not item[1], item[0].lower()))
 
     @staticmethod
     def _parse_json(raw_text: str) -> ShellPlan | None:

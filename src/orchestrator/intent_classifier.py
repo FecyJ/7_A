@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from jsonschema import ValidationError, validate
@@ -143,6 +144,26 @@ CONFIDENCE_LOW = 0.5
 
 
 # === 2. 环境上下文收集 ===
+def _format_workspace_entries(*, max_entries: int = 80, include_hidden: bool = True) -> str:
+    """生成稳定的当前目录概览，优先展示目录，避免顶层路径被截断漏掉。"""
+    try:
+        entries = sorted(
+            Path.cwd().iterdir(),
+            key=lambda item: (not item.is_dir(), item.name.lower()),
+        )
+    except OSError:
+        return "无法获取文件列表"
+
+    if not include_hidden:
+        entries = [entry for entry in entries if not entry.name.startswith(".")]
+
+    lines = [f"- {entry.name}{'/' if entry.is_dir() else ''}" for entry in entries[:max_entries]]
+    remaining = len(entries) - max_entries
+    if remaining > 0:
+        lines.append(f"...（还有 {remaining} 项未显示）")
+    return "\n".join(lines) if lines else "- （当前目录为空）"
+
+
 def get_advanced_context() -> dict[str, str]:
     """获取当前操作系统、工作目录、文件列表和 Git 状态。"""
     context = {
@@ -153,12 +174,7 @@ def get_advanced_context() -> dict[str, str]:
         "git_status": "",
     }
 
-    try:
-        ls_cmd = ["ls", "-la"] if platform.system() != "Windows" else ["dir"]
-        ls_output = subprocess.check_output(ls_cmd, text=True, stderr=subprocess.DEVNULL)
-        context["files"] = "\n".join(ls_output.splitlines()[:20])
-    except Exception:
-        context["files"] = "无法获取文件列表"
+    context["files"] = _format_workspace_entries(max_entries=80, include_hidden=True)
 
     try:
         git_output = subprocess.check_output(
@@ -215,7 +231,7 @@ def get_system_prompt(context: dict[str, str], extra_context: dict[str, str] | N
 - 操作系统: {context['os']}
 - Shell 类型: {context['shell']}
 - 工作目录: {context['pwd']}
-- 目录概览 (前20项):
+- 目录概览（最多 80 项，目录优先）:
 {context['files']}
 - Git 状态:
 {context['git_status']}{_format_extra_context(extra_context)}
@@ -510,12 +526,19 @@ def _looks_like_semantic_file_task(*texts: str) -> bool:
 
     file_markers = [
         "读取",
+        "阅读",
         "读一下",
         "读出",
         "read",
         "open",
         "查看文件",
+        "查看目录",
         "文件内容",
+        "目录",
+        "文件夹",
+        "路径",
+        "folder",
+        "directory",
         "readme",
         "config",
         "json",
@@ -550,6 +573,9 @@ def _looks_like_semantic_file_task(*texts: str) -> bool:
         "归纳",
         "复杂度",
         "审查",
+        "告诉",
+        "分别实现",
+        "实现了什么",
     ]
     return any(marker in combined for marker in file_markers) and any(
         marker in combined for marker in semantic_markers
@@ -612,6 +638,51 @@ def _extract_requested_workspace_path(user_input: str) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def _extract_existing_workspace_paths(user_input: str) -> list[str]:
+    """提取用户显式提到且确实存在于当前工作区内的相对路径。"""
+    text = user_input.strip()
+    if not text:
+        return []
+
+    raw_candidates: set[str] = set()
+    quoted_patterns = [r"`([^`]+)`", r'"([^"]+)"', r"'([^']+)'"]
+    for pattern in quoted_patterns:
+        raw_candidates.update(match.group(1) for match in re.finditer(pattern, text))
+
+    raw_candidates.update(
+        match.group(1)
+        for match in re.finditer(
+            r"(?<![\w.~/-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*/?)(?![\w.~/-])",
+            text,
+        )
+    )
+
+    workspace_root = Path.cwd().resolve()
+    existing_paths: set[str] = set()
+    for raw_candidate in raw_candidates:
+        candidate = raw_candidate.strip().strip("，。,.！？?：:；;（）()[]{}")
+        candidate = candidate.rstrip("/") or candidate
+        if not candidate or candidate in {".", ".."} or "://" in candidate:
+            continue
+
+        path = Path(candidate)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            continue
+
+        resolved = (workspace_root / path).resolve()
+        if not (resolved == workspace_root or workspace_root in resolved.parents):
+            continue
+        if not resolved.exists():
+            continue
+
+        normalized = str(resolved.relative_to(workspace_root))
+        if resolved.is_dir():
+            normalized += "/"
+        existing_paths.add(normalized)
+
+    return sorted(existing_paths)
 
 
 def _detect_under_specified_build_request(user_input: str) -> dict[str, Any] | None:
@@ -1214,6 +1285,35 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
     collapsed = _collapse_single_subtask_multi_agent(user_input, result)
     if collapsed is not None:
         return collapsed
+
+    existing_paths = _extract_existing_workspace_paths(user_input)
+    if (
+        intent == "clarification"
+        and existing_paths
+        and _looks_like_semantic_file_task(
+            user_input,
+            task_description,
+            str(result.get("question") or ""),
+        )
+    ):
+        reasoning = str(result.get("reasoning") or "").strip()
+        result["intent"] = "tool_agent"
+        result["risk_level"] = "low"
+        result["task_description"] = (
+            f"用户显式提到的路径在当前工作目录中存在：{', '.join(existing_paths)}。"
+            f"请按原始请求读取这些路径下的内容并完成总结/分析：{user_input}"
+        )
+        result["context_passed"] = existing_paths + [user_input]
+        result["reply"] = None
+        result["question"] = None
+        result["options"] = None
+        result["subtasks"] = None
+        if reasoning:
+            reasoning += "；检测到用户提到的相对路径实际存在，已取消误澄清并改路由为 tool_agent。"
+        else:
+            reasoning = "检测到用户提到的相对路径实际存在，已取消误澄清并改路由为 tool_agent。"
+        result["reasoning"] = reasoning
+        return result
 
     vague_build_request = _detect_under_specified_build_request(user_input)
     if vague_build_request is not None:

@@ -62,6 +62,10 @@ def _resolve_local_pass_confidence() -> float:
 
 
 LOCAL_PASS_CONFIDENCE = _resolve_local_pass_confidence()
+LOCAL_FASTPATH_ENABLED = _read_env_flag("LOCAL_FASTPATH_ENABLED", True) and not _read_env_flag(
+    "FORCE_CLOUD_ROUTING",
+    False,
+)
 LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH = _read_env_flag("LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH", False)
 LOCAL_PASS_INTENTS = {"shell_agent", "memory_agent"} | (
     {"direct_answer"} if LOCAL_ALLOW_DIRECT_ANSWER_FASTPATH else set()
@@ -160,8 +164,8 @@ class LocalAttempt:
     raw_text: str = ""
 
 
-def get_local_context(*, max_files: int = 10) -> dict[str, str]:
-    """收集精简版本地上下文：隐藏文件过滤 + 最多 10 项。"""
+def get_local_context(*, max_files: int = 80) -> dict[str, str]:
+    """收集精简版本地上下文：隐藏文件过滤 + 目录优先，避免顶层路径被截断。"""
     cwd = os.getcwd()
     files: list[str] = []
     try:
@@ -257,7 +261,7 @@ def get_local_system_prompt(context: dict[str, str], extra_context: dict[str, st
 - OS: {context['os']}
 - Shell: {context['shell']}
 - 当前目录: {context['pwd']}
-- 目录概览（最多 10 项，已过滤隐藏文件）:
+- 目录概览（最多 80 项，已过滤隐藏文件，目录优先）:
 {context['files']}
 - Git 状态: {context['git_status']}{_format_extra_context(extra_context)}
 
@@ -429,15 +433,23 @@ async def _request_local_fastpath_json(user_input: str, extra_context: dict[str,
     """向本地 Ollama 发起非流式 JSON 模式请求。"""
     context = get_local_context()
     system_prompt = get_local_system_prompt(context, extra_context=extra_context)
-    response = await local_slm_client.chat.completions.create(
-        model=LOCAL_SLM_MODEL,
-        messages=[
+    request_kwargs = {
+        "model": LOCAL_SLM_MODEL,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input},
         ],
-        temperature=0.1,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        response = await local_slm_client.chat.completions.create(**request_kwargs)
+    except OpenAIError as exc:
+        message = str(exc).lower()
+        if "response_format" not in message and "json_object" not in message:
+            raise
+        request_kwargs.pop("response_format", None)
+        response = await local_slm_client.chat.completions.create(**request_kwargs)
     return response.choices[0].message.content or ""
 
 
@@ -503,6 +515,40 @@ class DualEngineRouter:
         self.max_retries = max_retries
         self.verbose = verbose
 
+    async def _route_cloud(
+        self,
+        user_input: str,
+        *,
+        total_started: float,
+        fallback_reason: str,
+        local_latency_ms: float | None = None,
+        local_raw_text: str | None = None,
+        extra_context: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        cloud_started = perf_counter()
+        cloud_result = await asyncio.to_thread(
+            handle_intent,
+            user_input,
+            self.cloud_llm_client,
+            self.cloud_model,
+            self.max_retries,
+            self.verbose,
+            extra_context,
+        )
+        cloud_latency_ms = (perf_counter() - cloud_started) * 1000
+        cloud_result = dict(cloud_result)
+        cloud_result["_dual_engine"] = {
+            "engine": "cloud",
+            "local_model": LOCAL_SLM_MODEL,
+            "cloud_model": self.cloud_model,
+            "local_latency_ms": round(local_latency_ms, 2) if local_latency_ms is not None else None,
+            "cloud_latency_ms": round(cloud_latency_ms, 2),
+            "total_latency_ms": round((perf_counter() - total_started) * 1000, 2),
+            "fallback_reason": fallback_reason,
+            "local_raw_text": local_raw_text if self.verbose else None,
+        }
+        return cloud_result
+
     async def route(
         self,
         user_input: str,
@@ -512,6 +558,15 @@ class DualEngineRouter:
     ) -> dict[str, Any]:
         """先尝试本地 Fast-Path，失败后静默降级到云端。"""
         total_started = perf_counter()
+        if not LOCAL_FASTPATH_ENABLED:
+            # await _emit_status(status_callback, "已按配置跳过本地 Fast-Path，固定走云端")
+            return await self._route_cloud(
+                user_input,
+                total_started=total_started,
+                fallback_reason="local_fastpath_disabled",
+                extra_context=extra_context,
+            )
+
         local_attempt = await try_local_fastpath(user_input, extra_context=extra_context)
 
         if local_attempt.accepted and local_attempt.result is not None:
@@ -534,29 +589,14 @@ class DualEngineRouter:
         elif local_attempt.reason == "direct_answer_prefers_cloud":
             await _emit_status(status_callback, "本地 direct_answer 已限制，已切换云端")
 
-        cloud_started = perf_counter()
-        cloud_result = await asyncio.to_thread(
-            handle_intent,
+        return await self._route_cloud(
             user_input,
-            self.cloud_llm_client,
-            self.cloud_model,
-            self.max_retries,
-            self.verbose,
-            extra_context,
+            total_started=total_started,
+            fallback_reason=local_attempt.reason,
+            local_latency_ms=local_attempt.latency_ms,
+            local_raw_text=local_attempt.raw_text,
+            extra_context=extra_context,
         )
-        cloud_latency_ms = (perf_counter() - cloud_started) * 1000
-        cloud_result = dict(cloud_result)
-        cloud_result["_dual_engine"] = {
-            "engine": "cloud",
-            "local_model": LOCAL_SLM_MODEL,
-            "cloud_model": self.cloud_model,
-            "local_latency_ms": round(local_attempt.latency_ms or 0.0, 2) if local_attempt.latency_ms is not None else None,
-            "cloud_latency_ms": round(cloud_latency_ms, 2),
-            "total_latency_ms": round((perf_counter() - total_started) * 1000, 2),
-            "fallback_reason": local_attempt.reason,
-            "local_raw_text": local_attempt.raw_text if self.verbose else None,
-        }
-        return cloud_result
 
 
 async def route_user_input(
@@ -581,6 +621,7 @@ async def route_user_input(
 
 __all__ = [
     "DualEngineRouter",
+    "LOCAL_FASTPATH_ENABLED",
     "LOCAL_FASTPATH_JSON_SCHEMA",
     "LOCAL_FASTPATH_JSON_SCHEMA_NAME",
     "LOCAL_PASS_CONFIDENCE",

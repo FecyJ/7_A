@@ -98,6 +98,7 @@ class SessionManager:
             "last_file_path": state.get("last_file_path"),
             "last_document_content": state.get("last_document_content"),
             "last_document_summary": state.get("last_document_summary"),
+            "working_memory": state.get("working_memory") if isinstance(state.get("working_memory"), dict) else {},
         }
 
         for key in ("chat_history", "short_term_memory"):

@@ -27,6 +27,7 @@ try:
         validate_intent_result,
     )
     from .llm_client import generate_text_response, get_api_mode, get_llm_client
+    from .working_memory import WorkingMemory
     from ..shell_agent import ShellA2AAgent, ShellAgent
     from ..tool_agent import ToolA2AAgent, ToolAgent
     from Bonus.local_nlp import DualEngineRouter
@@ -51,6 +52,10 @@ except ImportError:
         validate_intent_result,
     )
     from llm_client import generate_text_response, get_api_mode, get_llm_client  # type: ignore
+    try:
+        from src.orchestrator.working_memory import WorkingMemory  # type: ignore
+    except ImportError:
+        from working_memory import WorkingMemory  # type: ignore
     try:
         from src.shell_agent import ShellA2AAgent, ShellAgent  # type: ignore
     except ImportError:
@@ -277,6 +282,7 @@ class OrchestratorAgent:
         self.last_file_path: str | None = None
         self.last_document_content: str | None = None
         self.last_document_summary: str | None = None
+        self.working_memory = WorkingMemory()
 
         self.agent_registry = AgentRegistry()
         self.agent_registry.register(ShellA2AAgent(self.shell_agent, shell_executor=self.shell_executor))
@@ -461,6 +467,9 @@ class OrchestratorAgent:
             extra_context["long_term_memory"] = long_term_text
 
         extra_context.update(self._build_document_artifact_context())
+        working_memory = self.working_memory.to_prompt(max_chars=1400)
+        if working_memory:
+            extra_context["working_memory"] = working_memory
 
         return extra_context, memory_hits
 
@@ -483,6 +492,7 @@ class OrchestratorAgent:
             "last_file_path": self.last_file_path,
             "last_document_content": self.last_document_content,
             "last_document_summary": self.last_document_summary,
+            "working_memory": self.working_memory.to_dict(),
         }
 
     def restore_session_state(self, state: dict[str, Any] | None) -> None:
@@ -520,6 +530,7 @@ class OrchestratorAgent:
         self.last_file_path = str(state.get("last_file_path") or "").strip() or None
         self.last_document_content = str(state.get("last_document_content") or "").strip() or None
         self.last_document_summary = str(state.get("last_document_summary") or "").strip() or None
+        self.working_memory = WorkingMemory.from_dict(state.get("working_memory"))
 
     def reset_session_state(self) -> None:
         """清空当前会话 RAM / Artifact。"""
@@ -528,6 +539,7 @@ class OrchestratorAgent:
         self.last_file_path = None
         self.last_document_content = None
         self.last_document_summary = None
+        self.working_memory = WorkingMemory()
 
     def _build_history_summary(self, result: OrchestratorResult) -> str:
         intent = str(result.get("intent") or "")
@@ -1058,6 +1070,17 @@ class OrchestratorAgent:
             "status": shell_result.get("status", "handled"),
         }
 
+    def _attach_working_memory(self, routed_task: OrchestratorResult, user_input: str) -> OrchestratorResult:
+        self.working_memory.set_objective(user_input or str(routed_task.get("task_description") or ""))
+        enriched = dict(routed_task)
+        enriched["working_memory"] = self.working_memory.to_dict()
+        return enriched
+
+    def _update_working_memory_from_tool_result(self, tool_result: OrchestratorResult) -> None:
+        payload = tool_result.get("working_memory")
+        if isinstance(payload, dict):
+            self.working_memory = WorkingMemory.from_dict(payload)
+
     async def _handle_tool_agent(
         self,
         user_input: str,
@@ -1066,6 +1089,7 @@ class OrchestratorAgent:
     ) -> OrchestratorResult:
         """通过 A2A 注册表将 tool 任务派发给 ToolAgent。"""
         ui.output_workflow("已将任务交给 Tool Agent", state="done")
+        routed_task = self._attach_working_memory(routed_task, user_input)
         task_description = routed_task.get("task_description")
         # if task_description:
         #     ui.output_workflow(f"任务说明：{task_description}", state="info")
@@ -1083,10 +1107,13 @@ class OrchestratorAgent:
             if response.error:
                 await ui.stream_llm(response.error)
         tool_result = response.payload.get("result", {}) if response.ok else {"status": "error", "error": response.error}
+        if isinstance(tool_result, dict):
+            self._update_working_memory_from_tool_result(tool_result)
         return {
             **routed_task,
             "tool_agent_result": tool_result,
             "status": tool_result.get("status", "handled"),
+            "working_memory": self.working_memory.to_dict(),
         }
 
     async def handle_input(self, user_input: str, ui: OrchestratorOutput) -> OrchestratorResult:
@@ -1123,6 +1150,7 @@ class OrchestratorAgent:
                 "shell_agent_result": direct_result,
             }
 
+        self.working_memory.set_objective(user_input)
         extra_context, memory_hits = self._build_routing_extra_context(user_input)
 
         ui.output_workflow("正在分析用户意图...", state="running")

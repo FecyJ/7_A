@@ -18,13 +18,16 @@ from rich.text import Text
 try:
     from ..orchestrator.llm_client import DEFAULT_MODEL, generate_text_response, get_llm_client
     from ..orchestrator.intent_classifier import _detect_temporal_query
+    from ..orchestrator.working_memory import WorkingMemory
 except ImportError:
     try:
         from src.orchestrator.llm_client import DEFAULT_MODEL, generate_text_response, get_llm_client  # type: ignore
         from src.orchestrator.intent_classifier import _detect_temporal_query  # type: ignore
+        from src.orchestrator.working_memory import WorkingMemory  # type: ignore
     except ImportError:
         from orchestrator.llm_client import DEFAULT_MODEL, generate_text_response, get_llm_client  # type: ignore
         from orchestrator.intent_classifier import _detect_temporal_query  # type: ignore
+        from orchestrator.working_memory import WorkingMemory  # type: ignore
 
 try:
     from .mcp_agent_client import MCPClient
@@ -162,6 +165,9 @@ class ToolAgent:
 - cwd: {cwd}
 - files_preview:
 {files_preview}
+
+【当前任务工作记忆】
+{working_memory}
 
 【可用工具】
 {available_tools}
@@ -583,6 +589,7 @@ class ToolAgent:
         routed_task: ToolPlan,
         tools: list[Any],
         observations: list[ToolObservation],
+        working_memory: WorkingMemory,
     ) -> ToolPlan:
         plan_schema = self._plan_schema(tools)
         system_prompt = self.SYSTEM_PROMPT.format(
@@ -593,6 +600,7 @@ class ToolAgent:
             orchestrator_risk_level=routed_task.get("risk_level", "low"),
             cwd=os.getcwd(),
             files_preview=self._cwd_preview(),
+            working_memory=working_memory.to_prompt(max_chars=2500) or "（暂无）",
             available_tools=self._tool_prompt_payload(tools),
             observations=self._observation_payload(observations),
         )
@@ -819,11 +827,17 @@ class ToolAgent:
                 normalized[key] = cls._absolute_workspace_path_to_relative(normalized[key])
         return normalized
 
-    def _synthesize_answer(self, user_input: str, observations: list[ToolObservation]) -> str:
+    def _synthesize_answer(
+        self,
+        user_input: str,
+        observations: list[ToolObservation],
+        working_memory: WorkingMemory | None = None,
+    ) -> str:
         observation_json = self._observation_payload(observations)
+        working_memory_text = working_memory.to_prompt(max_chars=3000) if working_memory is not None else ""
         return generate_text_response(
             self.SYNTHESIS_PROMPT,
-            f"用户问题：{user_input}\n\n工具返回：\n{observation_json}",
+            f"用户问题：{user_input}\n\n任务工作记忆：\n{working_memory_text or '（暂无）'}\n\n工具返回：\n{observation_json}",
             llm_client=self.llm_client,
             model=self.model,
             temperature=0.2,
@@ -1160,6 +1174,7 @@ class ToolAgent:
         user_input: str,
         routed_task: ToolPlan,
         ui: "OrchestratorOutput",
+        working_memory: WorkingMemory | None = None,
     ) -> ToolPlan | None:
         candidate = self._extract_explicit_file_candidate(
             user_input,
@@ -1186,19 +1201,27 @@ class ToolAgent:
 
         self._emit_workflow(ui, "正在调用工具：read_file", state="running")
         observation = await self._call_tool("read_file", {"file_path": resolved})
+        if working_memory is not None:
+            working_memory.record_tool_observation(
+                tool_name=observation.tool_name,
+                arguments=observation.arguments,
+                result=observation.result,
+                is_error=observation.is_error,
+            )
         if observation.is_error:
             self._emit_workflow(ui, f"工具返回错误：{self._shorten_text(observation.result)}", state="warn")
             return None
 
         # self._emit_workflow(ui, f"工具返回：{self._shorten_text(observation.result)}", state="info")
         self._emit_workflow(ui, self._synthesis_workflow_text([observation]), state="running")
-        final_answer = await asyncio.to_thread(self._synthesize_answer, user_input, [observation])
+        final_answer = await asyncio.to_thread(self._synthesize_answer, user_input, [observation], working_memory)
         await ui.stream_llm(final_answer)
         return {
             "intent": "respond",
             "status": "direct_file_summary",
             "answer": final_answer,
             "observations": [observation.to_prompt_dict()],
+            "working_memory": working_memory.to_dict() if working_memory is not None else None,
         }
 
     async def disconnect(self) -> None:
@@ -1233,12 +1256,15 @@ class ToolAgent:
 
             working_input = user_input
             working_task = dict(routed_task)
+            working_memory = WorkingMemory.from_dict(working_task.get("working_memory"))
+            working_memory.set_objective(working_input or str(working_task.get("task_description") or ""))
             direct_time_result = await self._direct_temporal_query_answer(
                 user_input=working_input,
                 routed_task=working_task,
                 ui=ui,
             )
             if direct_time_result is not None:
+                direct_time_result["working_memory"] = working_memory.to_dict()
                 return direct_time_result
 
             if self._looks_like_semantic_file_task(working_input, str(working_task.get("task_description") or "")):
@@ -1246,6 +1272,7 @@ class ToolAgent:
                     user_input=working_input,
                     routed_task=working_task,
                     ui=ui,
+                    working_memory=working_memory,
                 )
                 if direct_result is not None:
                     return direct_result
@@ -1259,7 +1286,14 @@ class ToolAgent:
 
             for _ in range(self.MAX_TOOL_ROUNDS):
                 self._emit_workflow(ui, "正在分析任务并选择工具...", state="running")
-                plan = await asyncio.to_thread(self._plan_action, working_input, working_task, tools, observations)
+                plan = await asyncio.to_thread(
+                    self._plan_action,
+                    working_input,
+                    working_task,
+                    tools,
+                    observations,
+                    working_memory,
+                )
                 intent = plan.get("intent")
 
                 if intent == "ask_clarification":
@@ -1271,6 +1305,7 @@ class ToolAgent:
                     if not answer:
                         self._emit_workflow(ui, "用户取消了澄清流程", state="warn")
                         plan["status"] = "cancelled_by_user"
+                        plan["working_memory"] = working_memory.to_dict()
                         return plan
                     self._emit_workflow(ui, f"已收到补充信息：{answer}", state="info")
                     working_input = self._augment_user_input(working_input, plan.get("question") or "补充信息", answer)
@@ -1281,6 +1316,7 @@ class ToolAgent:
                     self._emit_workflow(ui, "当前任务超出 Tool Agent 能力范围", state="warn")
                     await ui.stream_llm(plan.get("reason") or "当前 Tool Agent 无法安全完成该请求。")
                     plan["status"] = "refused"
+                    plan["working_memory"] = working_memory.to_dict()
                     return plan
 
                 if intent == "respond":
@@ -1288,6 +1324,7 @@ class ToolAgent:
                     await ui.stream_llm(plan.get("answer") or "工具任务已完成。")
                     plan["status"] = "responded"
                     plan["observations"] = [observation.to_prompt_dict() for observation in observations]
+                    plan["working_memory"] = working_memory.to_dict()
                     return plan
 
                 tool_name = str(plan.get("tool_name") or "").strip()
@@ -1295,12 +1332,14 @@ class ToolAgent:
                 if not tool_name:
                     fallback = self._fallback_plan(user_input, "缺少 tool_name")
                     fallback["status"] = "invalid_plan"
+                    fallback["working_memory"] = working_memory.to_dict()
                     return fallback
                 resolved_tool_name = self._resolve_tool_name(tool_name, tools)
                 if resolved_tool_name is None:
                     self._emit_workflow(ui, f"模型选择了不存在的工具：{tool_name}", state="warn")
                     fallback = self._fallback_plan(user_input, f"未知工具：{tool_name}")
                     fallback["status"] = "invalid_tool"
+                    fallback["working_memory"] = working_memory.to_dict()
                     return fallback
                 tool_name = resolved_tool_name
                 arguments = self._coerce_arguments(arguments, self._tool_schema_for(tool_name, tools))
@@ -1319,6 +1358,7 @@ class ToolAgent:
                 self._emit_workflow(ui, f"已选择工具：{self._shorten_text(invocation)}", state="done")
                 decision = check_tool_permission(tool_name, **arguments)
                 if decision.status == "deny":
+                    working_memory.record_error(f"{tool_name} 权限拒绝：{decision.reason}")
                     self._emit_workflow(ui, "检测到高风险/越界工具调用，已拒绝执行", state="warn")
                     await ui.stream_llm(decision.reason)
                     return {
@@ -1327,6 +1367,7 @@ class ToolAgent:
                         "reason": decision.reason,
                         "tool_name": tool_name,
                         "arguments": arguments,
+                        "working_memory": working_memory.to_dict(),
                     }
 
                 if decision.status == "ask":
@@ -1339,12 +1380,19 @@ class ToolAgent:
                             "status": "cancelled_by_user",
                             "tool_name": tool_name,
                             "arguments": arguments,
+                            "working_memory": working_memory.to_dict(),
                         }
                     self._emit_workflow(ui, "已收到确认，准备调用工具", state="done")
 
                 self._emit_workflow(ui, f"正在调用工具：{tool_name}", state="running")
                 observation = await self._call_tool(tool_name, arguments)
                 observations.append(observation)
+                working_memory.record_tool_observation(
+                    tool_name=observation.tool_name,
+                    arguments=observation.arguments,
+                    result=observation.result,
+                    is_error=observation.is_error,
+                )
                 if observation.is_error:
                     self._emit_workflow(ui, f"工具返回错误：{self._shorten_text(observation.result)}", state="warn")
                 # else:
@@ -1363,13 +1411,14 @@ class ToolAgent:
 
             self._emit_workflow(ui, summary_reason, state="warn")
             self._emit_workflow(ui, self._synthesis_workflow_text(observations), state="running")
-            final_answer = await asyncio.to_thread(self._synthesize_answer, working_input, observations)
+            final_answer = await asyncio.to_thread(self._synthesize_answer, working_input, observations, working_memory)
             await ui.stream_llm(final_answer)
             return {
                 "intent": "respond",
                 "status": summary_status,
                 "answer": final_answer,
                 "observations": [observation.to_prompt_dict() for observation in observations],
+                "working_memory": working_memory.to_dict(),
             }
         finally:
             try:

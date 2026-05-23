@@ -206,10 +206,15 @@ def _format_extra_context(extra_context: dict[str, str] | None) -> str:
     sections: list[str] = []
     short_term = str(extra_context.get("short_term_memory") or "").strip()
     long_term = str(extra_context.get("long_term_memory") or "").strip()
+    working_memory = str(extra_context.get("working_memory") or "").strip()
 
     if short_term:
         sections.append(f"""短期会话上下文（RAM）：
 {short_term}""")
+
+    if working_memory:
+        sections.append(f"""当前任务工作记忆：
+{working_memory}""")
 
     if long_term:
         sections.append(f"""长期记忆注入（ROM）：

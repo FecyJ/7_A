@@ -196,11 +196,17 @@ def _format_extra_context(extra_context: dict[str, str] | None) -> str:
     sections: list[str] = []
     short_term = str(extra_context.get("short_term_memory") or "").strip()
     long_term = str(extra_context.get("long_term_memory") or "").strip()
+    working_memory = str(extra_context.get("working_memory") or "").strip()
 
     if short_term:
         sections.append(f"""【短期会话上下文（RAM）】
 以下是最近几轮对话摘要，请用它解决“那个文件 / 上一步结果 / 刚才提到的路径”等代词指代问题：
 {short_term}""")
+
+    if working_memory:
+        sections.append(f"""【当前任务工作记忆】
+以下是本会话内已探索路径、已读文件摘要、工具观察和最近错误。请用它避免重复操作并保持多步任务连续：
+{working_memory}""")
 
     if long_term:
         sections.append(f"""【长期记忆注入（ROM）】

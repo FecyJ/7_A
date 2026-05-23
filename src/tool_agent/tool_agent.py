@@ -142,6 +142,7 @@ class ToolAgent:
 - 不要臆造文件路径、工具名或参数。
 - arguments 的键名必须与 input_schema 中的字段名完全一致；例如 read_file 必须使用 file_path。
 - list_dir / stat_path / search_files / read_file / write_file / append_file / replace_in_file / create_directory 仅允许当前工作目录内的相对路径；如果路径不明确，应先 ask_clarification。
+- 如果上一步工具返回 path 字段，后续工具调用必须原样使用该相对路径；不要把它改写成绝对路径。
 - 探索项目优先使用 list_dir、stat_path、search_files；读取大文件时使用 read_file 的 start_line/end_line/max_chars。
 - 修改已有文本文件优先使用 replace_in_file 做精确替换；写入新文件使用 write_file 且 overwrite=false，必要时设置 create_dirs=true；追加内容使用 append_file。
 - 对“时间/日期/星期、天气、新闻、汇率、最新/实时数据”等时效性问题，禁止凭模型记忆直接回答。
@@ -773,6 +774,51 @@ class ToolAgent:
 
         return arguments
 
+    @staticmethod
+    def _absolute_workspace_path_to_relative(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+
+        raw_value = value.strip()
+        if not raw_value or raw_value.startswith("~"):
+            return value
+
+        candidate = Path(raw_value)
+        if not candidate.is_absolute():
+            return value
+
+        workspace = Path.cwd().resolve()
+        try:
+            resolved = candidate.resolve(strict=False)
+            relative = resolved.relative_to(workspace)
+        except (OSError, ValueError):
+            return value
+
+        relative_text = relative.as_posix()
+        return relative_text or "."
+
+    @classmethod
+    def _normalize_workspace_path_arguments(cls, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        path_keys_by_tool = {
+            "list_dir": ("path",),
+            "stat_path": ("path",),
+            "search_files": ("path",),
+            "read_file": ("file_path",),
+            "write_file": ("file_path",),
+            "append_file": ("file_path",),
+            "replace_in_file": ("file_path",),
+            "create_directory": ("dir_path",),
+        }
+        path_keys = path_keys_by_tool.get(tool_name)
+        if not path_keys:
+            return arguments
+
+        normalized = dict(arguments)
+        for key in path_keys:
+            if key in normalized:
+                normalized[key] = cls._absolute_workspace_path_to_relative(normalized[key])
+        return normalized
+
     def _synthesize_answer(self, user_input: str, observations: list[ToolObservation]) -> str:
         observation_json = self._observation_payload(observations)
         return generate_text_response(
@@ -1258,6 +1304,7 @@ class ToolAgent:
                     return fallback
                 tool_name = resolved_tool_name
                 arguments = self._coerce_arguments(arguments, self._tool_schema_for(tool_name, tools))
+                arguments = self._normalize_workspace_path_arguments(tool_name, arguments)
                 planned_signature = json.dumps(
                     {"tool_name": tool_name, "arguments": arguments},
                     ensure_ascii=False,

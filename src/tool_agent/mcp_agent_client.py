@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from contextlib import AsyncExitStack
@@ -19,7 +20,7 @@ try:
 except ImportError:
     from security import check_tool_permission  # type: ignore
 
-load_dotenv()
+load_dotenv(os.getenv("DOTENV_PATH") or None)
 
 
 DEFAULT_SERVER_SCRIPT = Path(__file__).with_name("mcp_server.py")

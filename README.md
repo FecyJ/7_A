@@ -51,13 +51,37 @@ FORCE_CLOUD_ROUTING=true
 bash start_agent.sh
 ```
 
+默认工作区是执行脚本时所在目录。也可以显式指定工作区：
+
+```bash
+bash start_agent.sh --workspace /path/to/workspace
+AGENT_WORKSPACE=/path/to/workspace bash start_agent.sh
+```
+
 如果 Python 不在默认 `venv` 中：
 
 ```bash
 PYTHON_BIN=/path/to/python bash start_agent.sh
 ```
 
-### 方式 2：直接运行入口
+### 方式 2：安装命令标识符
+
+可把仓库内包装器软链到 `PATH` 中的目录，获得类似 `codex` / `claude` 的启动方式：
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/bin/acee-agent" ~/.local/bin/acee-agent
+```
+
+之后可在任意工作区运行：
+
+```bash
+cd /path/to/workspace
+acee-agent
+acee-agent --workspace /other/workspace
+```
+
+### 方式 3：直接运行入口
 
 ```bash
 export PYTHONPATH=$(pwd)

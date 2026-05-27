@@ -1116,7 +1116,9 @@ class OrchestratorAgent:
             "working_memory": self.working_memory.to_dict(),
         }
 
-    async def handle_input(self, user_input: str, ui: OrchestratorOutput) -> OrchestratorResult:
+    MAX_CLARIFY_DEPTH = 3
+
+    async def handle_input(self, user_input: str, ui: OrchestratorOutput, *, _clarify_depth: int = 0) -> OrchestratorResult:
         """后端统一输入入口：接收用户输入并回写前端。"""
         user_input = user_input.strip()
         if not user_input:
@@ -1208,6 +1210,12 @@ class OrchestratorAgent:
             options = [str(option).strip() for option in list(result.get("options") or []) if str(option).strip()]
 
             if options:
+                if _clarify_depth >= self.MAX_CLARIFY_DEPTH:
+                    clarification_text = self._build_clarification_markdown(result)
+                    await self._stream_response(ui, clarification_text, markdown=True)
+                    self._remember_exchange(user_input, clarification_text)
+                    return {**result, "status": "clarification_depth_exceeded"}
+
                 selected = await ui.prompt_clarification(
                     question=question,
                     options=options,
@@ -1221,7 +1229,7 @@ class OrchestratorAgent:
                         question=question,
                         answer=selected,
                     )
-                    return await self.handle_input(followup_input, ui)
+                    return await self.handle_input(followup_input, ui, _clarify_depth=_clarify_depth + 1)
 
                 self._remember_exchange(user_input, question)
                 return {

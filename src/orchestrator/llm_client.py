@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 
-load_dotenv()
+load_dotenv(os.getenv("DOTENV_PATH") or None)
 
 
 def _apply_openai_env_aliases() -> None:

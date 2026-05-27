@@ -1280,7 +1280,6 @@ class ToolAgent:
             observations: list[ToolObservation] = []
             clarification_rounds = 0
             last_tool_signature: str | None = None
-            repeated_tool_calls = 0
             summary_reason = "工具调用轮次已达上限，正在整理当前结果..."
             summary_status = "max_rounds_reached"
 
@@ -1398,16 +1397,7 @@ class ToolAgent:
                 # else:
                     # self._emit_workflow(ui, f"工具返回：{self._shorten_text(observation.result)}", state="info")
 
-                if planned_signature == last_tool_signature:
-                    repeated_tool_calls += 1
-                else:
-                    repeated_tool_calls = 0
-                    last_tool_signature = planned_signature
-
-                if repeated_tool_calls >= 1:
-                    summary_reason = "检测到重复工具调用，正在整理已有结果..."
-                    summary_status = "repeated_tool_call_summarized"
-                    break
+                last_tool_signature = planned_signature
 
             self._emit_workflow(ui, summary_reason, state="warn")
             self._emit_workflow(ui, self._synthesis_workflow_text(observations), state="running")

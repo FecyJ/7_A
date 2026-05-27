@@ -487,6 +487,42 @@ def _infer_fallback_risk(text: str) -> str:
     return "low"
 
 
+def _looks_like_web_search(user_input: str) -> bool:
+    """判断用户输入是否意图进行联网搜索而非本地文件搜索。"""
+    lowered = user_input.strip().lower()
+    if not lowered:
+        return False
+
+    web_search_markers = [
+        "联网搜索", "联网查找", "网上搜索", "上网搜索", "上网查",
+        "google搜索", "google 搜索", "谷歌搜索", "谷歌 搜索",
+        "bing搜索", "bing 搜索", "百度搜索", "百度 搜索",
+        "web search", "search the web", "search online",
+        "搜一下", "帮我搜", "帮我查一下",
+    ]
+    if any(marker in lowered for marker in web_search_markers):
+        return True
+
+    web_context_markers = ["网上", "在线", "联网", "网络", "互联网", "web", "online", "internet"]
+    search_action_markers = ["搜索", "查找", "查一下", "搜一下", "搜搜", "检索", "找一下", "帮我找"]
+    has_web_context = any(marker in lowered for marker in web_context_markers)
+    has_search_action = any(marker in lowered for marker in search_action_markers)
+    if has_web_context and has_search_action:
+        return True
+
+    # "搜索/查找 + 抽象主题"（不含文件/目录引用）大概率是联网搜索
+    local_fs_markers = [
+        "文件", "目录", "文件夹", "当前目录", "工作区", "路径",
+        ".py", ".js", ".ts", ".json", ".yaml", ".md", ".txt", ".log", ".html", ".css",
+        "readme", "config",
+    ]
+    looks_local = any(marker in lowered for marker in local_fs_markers)
+    if has_search_action and not looks_local:
+        return True
+
+    return False
+
+
 def _looks_like_shell_request(user_input: str) -> bool:
     """判断用户输入是否更像本地命令/文件系统任务。"""
     lowered = user_input.lower()
@@ -1406,6 +1442,26 @@ def apply_intent_overrides(user_input: str, result: IntentResult) -> IntentResul
         else:
             reasoning = "检测到这是“读取文件后做语义理解/总结”的任务，按规则路由为 tool_agent。"
         result["reasoning"] = reasoning
+
+    if _looks_like_web_search(user_input) and intent in {"shell_agent", "direct_answer", "clarification"}:
+        reasoning = str(result.get("reasoning") or "").strip()
+        result["intent"] = "tool_agent"
+        result["risk_level"] = "low"
+        result["task_description"] = (
+            f"用户请求联网搜索：{user_input}。"
+            f"请使用 web_search 工具执行搜索，必要时用 http_request 抓取搜索结果中的页面全文，最后整理回答。"
+        )
+        result["context_passed"] = [user_input]
+        result["reply"] = None
+        result["question"] = None
+        result["options"] = None
+        result["subtasks"] = None
+        if reasoning:
+            reasoning += "；检测到这是联网搜索请求，改路由为 tool_agent。"
+        else:
+            reasoning = "检测到这是联网搜索请求，改路由为 tool_agent。"
+        result["reasoning"] = reasoning
+        return result
 
     if intent == "multi_agent" and isinstance(subtasks, list):
         normalized_subtasks: list[dict[str, Any]] = []

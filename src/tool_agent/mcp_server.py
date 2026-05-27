@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import certifi
 import httpx
+from ddgs import DDGS
 from mcp.server.fastmcp import FastMCP
 
 try:
@@ -100,6 +101,21 @@ def _stringify_mapping(data: dict[str, Any] | None) -> dict[str, str] | None:
     return {str(key): str(value) for key, value in data.items() if value is not None}
 
 
+def _extract_text_from_html(html_text: str) -> str:
+    """从 HTML 中提取纯文本，去除标签、脚本和样式。"""
+    import re
+    cleaned = re.sub(
+        r"<(script|style|noscript|iframe|svg)[^>]*>.*?</\1>",
+        "",
+        html_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", " ", cleaned)
+    text = re.sub(r"&[a-z]+;", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def _preview_response_body(response: httpx.Response, max_chars: int) -> str:
     content_type = response.headers.get("content-type", "").lower()
     if "application/json" in content_type:
@@ -107,6 +123,8 @@ def _preview_response_body(response: httpx.Response, max_chars: int) -> str:
             preview = json.dumps(response.json(), ensure_ascii=False, indent=2)
         except ValueError:
             preview = response.text
+    elif "text/html" in content_type and response.text:
+        preview = _extract_text_from_html(response.text)
     elif response.text:
         preview = response.text
     else:
@@ -871,6 +889,65 @@ def replace_in_file_tool(
         path=file_path,
         char_count=len(updated),
         byte_count=len(updated.encode("utf-8")),
+    )
+
+
+@mcp.tool(
+    name="web_search",
+    description=(
+        "通过 DuckDuckGo 搜索引擎搜索网页，返回标题、URL 和摘要。"
+        "搜索结果中的 URL 可通过 http_request 进一步抓取页面全文。"
+        "注意：此工具需要安装 duckduckgo_search 包 (pip install duckduckgo_search)。"
+    ),
+)
+def web_search(query: str, max_results: int = 10) -> str:
+    import time
+
+    query = str(query or "").strip()
+    if not query:
+        return json.dumps({"ok": False, "error": "query 不能为空。"}, ensure_ascii=False)
+
+    max_results = max(1, min(int(max_results or 10), 30))
+    last_error = ""
+    for attempt in range(3):
+        try:
+            with DDGS() as ddgs:
+                raw_results = list(ddgs.text(query, max_results=max_results))
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+            continue
+
+        results: list[dict[str, Any]] = []
+        for item in raw_results:
+            results.append(
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("href", ""),
+                    "content": (item.get("body") or "")[:500],
+                }
+            )
+        return json.dumps(
+            {
+                "ok": True,
+                "source": "duckduckgo",
+                "query": query,
+                "results": results,
+                "hint": None if results else "搜索未返回结果，建议尝试更通用或不同的关键词重新搜索。",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "ok": False,
+            "source": "duckduckgo",
+            "query": query,
+            "error": f"搜索失败（重试 3 次均失败）：{last_error}",
+        },
+        ensure_ascii=False,
     )
 
 

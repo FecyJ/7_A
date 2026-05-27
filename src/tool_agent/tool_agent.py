@@ -71,8 +71,8 @@ class ToolObservation:
 
     def to_prompt_dict(self) -> dict[str, Any]:
         result = self.result
-        if len(result) > 2000:
-            result = result[:2000].rstrip() + "..."
+        if len(result) > 4000:
+            result = result[:4000].rstrip() + "..."
         return {
             "tool_name": self.tool_name,
             "arguments": self.arguments,
@@ -136,8 +136,8 @@ class ToolAgent:
    - 当你已经拥有足够信息，可直接向用户输出最终结果时使用。
    - answer 必须为完整回答。
 3. ask_clarification
-   - 当目标文件、参数、对象不明确时使用。
-   - question 说明还缺什么，options 可以给候选项。
+   - 仅在以下情况使用：(a) 缺少调用工具所必需的文件路径/URL/参数；(b) 用户指令有歧义导致你无法确定该用哪个工具。
+   - 严禁以下情况 ask_clarification：(a) 搜索/查询工具已返回结果但你觉得不完美——此时必须 respond 汇报结果；(b) 名称/术语搜不到——此时必须 respond 说明而非反问用户。
 4. refuse
    - 当任务超出当前工具能力范围，或你判断不适合继续时使用。
 
@@ -150,6 +150,9 @@ class ToolAgent:
 - 修改已有文本文件优先使用 replace_in_file 做精确替换；写入新文件使用 write_file 且 overwrite=false，必要时设置 create_dirs=true；追加内容使用 append_file。
 - 对“时间/日期/星期、天气、新闻、汇率、最新/实时数据”等时效性问题，禁止凭模型记忆直接回答。
 - 时间/日期优先使用 get_live_time / get_current_time；天气优先使用 get_weather；新闻优先使用 get_news；汇率优先使用 get_exchange_rate。
+	- 对"搜索/查找/查询 某主题/某技术/某概念"等需要联网获取最新信息的请求，优先使用 web_search 搜索；搜索结果中的 URL 可通过 http_request 抓取页面全文。
+	- web_search 返回 ok=true 但 results 为空时，说明该搜索引擎对这个查询没有找到结果，不要当作"搜索失败/报错"，应尝试换一组更通用的关键词或换一个角度重新搜索；连续 2 次空结果后再 refuse。
+	- web_search 返回标题+URL+摘要后，如果摘要已经足够回答，直接 respond；如果某个 URL 内容需要深入阅读，再用 http_request 获取全文。
 - 如果使用 http_request，必须提供明确的 http/https URL；禁止尝试 localhost、内网地址或虚构私有接口。
 - 如果前一轮工具结果已经足够回答，优先 respond，不要无意义重复调用工具。
 - 如果用户想要实时天气、联网搜索、外部 API 等，而当前工具不支持，应 refuse 并说明原因。

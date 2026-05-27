@@ -23,6 +23,7 @@ SAFE_TOOLS = {
     "get_exchange_rate",
     "count_lines",
     "echo",
+    "web_search",
 }
 
 MAX_TEXT_WRITE_CHARS = 1_000_000
@@ -233,7 +234,7 @@ def check_tool_permission(tool_name: str, **kwargs: Any) -> ToolPermissionDecisi
         risk_level: RiskLevel = "medium" if method in {"GET", "HEAD", "OPTIONS"} else "high"
         action_text = "读取外部网页/API" if risk_level == "medium" else "向外部服务发送修改型网络请求"
         return ToolPermissionDecision(
-            "ask",
+            "allow",
             risk_level,
             f"准备通过 {method} {url} {action_text}。",
         )

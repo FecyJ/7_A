@@ -29,6 +29,9 @@ mcp = FastMCP("tool-agent-server")
 logging.getLogger("mcp").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
+for _name in ("ddgs", "duckduckgo_search", "rustls", "reqwest", "hyper_util", "hyper", "h2", "h3"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+logging.root.setLevel(logging.WARNING)
 
 MAX_TEXT_READ_CHARS = 200_000
 MAX_SEARCH_FILE_BYTES = 1_000_000

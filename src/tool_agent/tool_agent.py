@@ -45,16 +45,33 @@ ToolPlan = dict[str, Any]
 TOOL_AGENT_SCHEMA_NAME = "tool_agent_plan"
 TOOL_AGENT_OUTPUT_SCHEMA = {
     "type": "object",
-    "required": ["intent", "reason", "tool_name", "arguments", "question", "options", "answer"],
+    "required": ["intent", "reason", "tool_name", "arguments", "calls", "question", "options", "answer"],
     "additionalProperties": False,
     "properties": {
         "intent": {
             "type": "string",
-            "enum": ["call_tool", "respond", "ask_clarification", "refuse"],
+            "enum": ["call_tool", "call_tools", "respond", "ask_clarification", "refuse"],
         },
         "reason": {"type": "string"},
         "tool_name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "arguments": {"anyOf": [{"type": "object", "additionalProperties": True}, {"type": "null"}]},
+        "calls": {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["tool_name", "arguments"],
+                        "additionalProperties": False,
+                        "properties": {
+                            "tool_name": {"type": "string"},
+                            "arguments": {"type": "object", "additionalProperties": True},
+                        },
+                    },
+                },
+                {"type": "null"},
+            ]
+        },
         "question": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "options": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
         "answer": {"anyOf": [{"type": "string"}, {"type": "null"}]},
@@ -126,19 +143,26 @@ class ToolAgent:
 输出必须符合以下 schema：
 {json_schema}
 
-你可以输出四种 intent：
+你可以输出五种 intent：
 1. call_tool
    - 当你需要调用一个工具来获取信息或执行低风险工具动作时使用。
    - 一次只能选择一个工具。
    - tool_name 必须来自可用工具列表。
    - arguments 必须是 JSON 对象，并符合该工具的 input_schema。
-2. respond
+2. call_tools
+   - 当你需要同时调用多个互不依赖的工具时使用。这些调用会并行执行。
+   - 典型场景：web_search 返回多个 URL 后，一次性并行抓取 2~5 个页面；或同时搜索多个关键词。
+   - calls 数组至少包含 2 个调用，每个调用指定 tool_name 和 arguments。
+   - 有先后依赖的场景（如先 read_file 再 replace_in_file）不能用 call_tools。
+   - 此时 tool_name 和 arguments 字段填 null，调用内容放在 calls 数组中。
+   - 单次最多并行 6 个工具。
+3. respond
    - 当你已经拥有足够信息，可直接向用户输出最终结果时使用。
    - answer 必须为完整回答。
-3. ask_clarification
+4. ask_clarification
    - 仅在以下情况使用：(a) 缺少调用工具所必需的文件路径/URL/参数；(b) 用户指令有歧义导致你无法确定该用哪个工具。
    - 严禁以下情况 ask_clarification：(a) 搜索/查询工具已返回结果但你觉得不完美——此时必须 respond 汇报结果；(b) 名称/术语搜不到——此时必须 respond 说明而非反问用户。
-4. refuse
+5. refuse
    - 当任务超出当前工具能力范围，或你判断不适合继续时使用。
 
 重要规则：
@@ -494,6 +518,7 @@ class ToolAgent:
         normalized.setdefault("reason", "")
         normalized.setdefault("tool_name", None)
         normalized.setdefault("arguments", None)
+        normalized.setdefault("calls", None)
         normalized.setdefault("question", None)
         normalized.setdefault("options", None)
         normalized.setdefault("answer", None)
@@ -509,6 +534,12 @@ class ToolAgent:
                 {"type": "null"},
             ]
         }
+        calls_props = schema["properties"]["calls"]
+        if isinstance(calls_props, dict):
+            for variant in (calls_props.get("anyOf") or []):
+                items = variant.get("items") if isinstance(variant, dict) else None
+                if isinstance(items, dict) and "tool_name" in items.get("properties", {}):
+                    items["properties"]["tool_name"] = {"type": "string", "enum": tool_names}
         return schema
 
     @staticmethod
@@ -524,6 +555,17 @@ class ToolAgent:
                 return False, "call_tool 必须提供非空 tool_name"
             if plan.get("arguments") is not None and not isinstance(plan.get("arguments"), dict):
                 return False, "call_tool 的 arguments 必须为对象或 null"
+        elif intent == "call_tools":
+            calls = plan.get("calls")
+            if not isinstance(calls, list) or len(calls) < 2:
+                return False, "call_tools 的 calls 必须包含至少 2 个工具调用"
+            for i, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    return False, f"calls[{i}] 不是对象"
+                if not isinstance(call.get("tool_name"), str) or not call["tool_name"].strip():
+                    return False, f"calls[{i}] 必须提供非空 tool_name"
+                if not isinstance(call.get("arguments"), dict):
+                    return False, f"calls[{i}] 的 arguments 必须为对象"
         elif intent == "respond":
             if not isinstance(plan.get("answer"), str) or not plan["answer"].strip():
                 return False, "respond 必须提供非空 answer"
@@ -540,6 +582,7 @@ class ToolAgent:
             "reason": f"Tool Agent 未能稳定生成结构化动作。原始输出: {cleaned[:160]}" if cleaned else "Tool Agent 未能稳定生成结构化动作。",
             "tool_name": None,
             "arguments": None,
+            "calls": None,
             "question": f"我理解你想处理这个任务：{user_input}\n\n但我还不能稳定确定下一步工具动作，请补充更明确的目标、文件路径或参数。",
             "options": None,
             "answer": None,
@@ -1328,6 +1371,72 @@ class ToolAgent:
                     plan["observations"] = [observation.to_prompt_dict() for observation in observations]
                     plan["working_memory"] = working_memory.to_dict()
                     return plan
+
+                if intent == "call_tools":
+                    calls = plan.get("calls") or []
+                    resolved_calls: list[dict[str, Any]] = []
+                    for call in calls:
+                        ct_name_in = str(call.get("tool_name", "")).strip()
+                        ct_args = normalize_tool_arguments(call.get("arguments"))
+                        ct_name = self._resolve_tool_name(ct_name_in, tools)
+                        if ct_name is None:
+                            self._emit_workflow(ui, f"call_tools 中工具不存在：{ct_name_in}", state="warn")
+                            fallback = self._fallback_plan(user_input, f"未知工具：{ct_name_in}")
+                            fallback["status"] = "invalid_tool"
+                            fallback["working_memory"] = working_memory.to_dict()
+                            return fallback
+                        ct_args = self._coerce_arguments(ct_args, self._tool_schema_for(ct_name, tools))
+                        ct_args = self._normalize_workspace_path_arguments(ct_name, ct_args)
+                        decision = check_tool_permission(ct_name, **ct_args)
+                        if decision.status == "deny":
+                            working_memory.record_error(f"{ct_name} 权限拒绝：{decision.reason}")
+                            self._emit_workflow(ui, f"call_tools 中 {ct_name} 权限拒绝，跳过", state="warn")
+                            continue
+                        resolved_calls.append({
+                            "tool_name": ct_name,
+                            "arguments": ct_args,
+                            "decision": decision,
+                        })
+                    if not resolved_calls:
+                        continue
+                    for rc in resolved_calls:
+                        if rc["decision"].status == "ask":
+                            self._emit_workflow(ui, f"批量工具调用需确认：{rc['tool_name']}", state="warn")
+                            confirmed = await self._confirm_tool_call(rc["tool_name"], rc["arguments"], rc["decision"], ui)
+                            if not confirmed:
+                                rc["_skip"] = True
+                    invocation_parts = [
+                        self._render_tool_invocation(rc["tool_name"], rc["arguments"])
+                        for rc in resolved_calls if not rc.get("_skip")
+                    ]
+                    self._emit_workflow(
+                        ui,
+                        f"已选择并行工具（{len(invocation_parts)} 个）：{' | '.join(invocation_parts)}",
+                        state="done",
+                    )
+                    async def _execute_one(rc: dict[str, Any]) -> ToolObservation | None:
+                        if rc.get("_skip"):
+                            return None
+                        return await self._call_tool(rc["tool_name"], rc["arguments"])
+                    batch_results = await asyncio.gather(*[_execute_one(rc) for rc in resolved_calls])
+                    for rc, obs in zip(resolved_calls, batch_results):
+                        if obs is None:
+                            continue
+                        self._emit_workflow(ui, f"正在调用工具：{rc['tool_name']}", state="running")
+                        observations.append(obs)
+                        working_memory.record_tool_observation(
+                            tool_name=obs.tool_name,
+                            arguments=obs.arguments,
+                            result=obs.result,
+                            is_error=obs.is_error,
+                        )
+                        if obs.is_error:
+                            self._emit_workflow(ui, f"工具返回错误（{rc['tool_name']}）：{self._shorten_text(obs.result)}", state="warn")
+                    last_tool_signature = json.dumps(
+                        [{"tool_name": rc["tool_name"], "arguments": rc["arguments"]} for rc in resolved_calls],
+                        ensure_ascii=False, sort_keys=True,
+                    )
+                    continue
 
                 tool_name = str(plan.get("tool_name") or "").strip()
                 arguments = normalize_tool_arguments(plan.get("arguments"))
